@@ -307,3 +307,48 @@ def test_plane_strain_sigma_h_includes_sigma_zz() -> None:
     sh_ref = (sxx + syy + szz) / 3.0
     err = torch.max(torch.abs(sig["sigma_h"] - sh_ref)).item()
     assert err < 1e-6
+
+
+def test_diffusion_rhs_conservative_for_zero_flux_case() -> None:
+    """零通量边界、无耦合漂移时扩散项应近似守恒。"""
+    cfg = load_config("configs/notch_case.yaml")
+    cfg.runtime.device = "cpu"
+    cfg.ml.enabled = False
+    cfg.domain.nx = 48
+    cfg.domain.ny = 32
+    cfg.numerics.scalar_bc = "neumann"
+    sim = CoupledSimulator(cfg)
+    torch.manual_seed(1)
+    c = torch.rand_like(sim.state["c"])
+    phi = sim.state["phi"]
+    hphi = torch.clamp(phi, 0.0, 1.0)
+    D = cfg.corrosion.D_s_m2_s * hphi + (1.0 - hphi) * cfg.corrosion.D_l_m2_s
+    gx_phi = torch.zeros_like(phi)
+    gy_phi = torch.zeros_like(phi)
+    corr = torch.zeros_like(phi)
+    rhs = sim._diffusion_rhs(c, D, corr, gx_phi, gy_phi, phi)
+    # 面积加权平均变化率应接近 0。
+    mass_rate = float(sim._mean_field(rhs).item())
+    assert abs(mass_rate) < 5e-9
+
+
+def test_mechanics_adaptive_trigger_updates_early() -> None:
+    """当微结构突变超过阈值时，力学应提前更新。"""
+    cfg = load_config("configs/notch_case.yaml")
+    cfg.runtime.device = "cpu"
+    cfg.ml.enabled = False
+    cfg.domain.nx = 40
+    cfg.domain.ny = 28
+    cfg.numerics.mechanics_update_every = 100
+    cfg.numerics.mechanics_trigger_phi_max_delta = 1e-4
+    cfg.numerics.mechanics_trigger_eta_max_delta = 0.0
+    sim = CoupledSimulator(cfg)
+    # 第一步会执行力学并建立参考态。
+    sim._physics_step(cfg.numerics.dt_s, 1)
+    n1 = sim.stats["mech_predict_solve"]
+    # 非周期步手工施加较大相场扰动，触发自适应力学更新。
+    sim.state["phi"] = torch.clamp(sim.state["phi"], 0.0, 1.0)
+    sim.state["phi"][:, :, 6:9, 6:9] = torch.clamp(sim.state["phi"][:, :, 6:9, 6:9] - 0.02, 0.0, 1.0)
+    sim._physics_step(cfg.numerics.dt_s, 2)
+    n2 = sim.stats["mech_predict_solve"]
+    assert n2 == n1 + 1

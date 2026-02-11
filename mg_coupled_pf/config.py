@@ -104,6 +104,14 @@ class NumericsConfig:
     mechanics_krylov_fail_streak_to_pause: int = 3
     mechanics_krylov_pause_steps: int = 30
     mechanics_use_ml_initial_guess: bool = False
+    # 标量场离散边界条件：
+    # - neumann: 零法向梯度/零通量（默认）
+    # - periodic: 周期边界
+    # - dirichlet0: 零值 Dirichlet
+    scalar_bc: str = "neumann"
+    # 力学自适应触发阈值（当 mechanics_update_every>1 时可提前触发力学更新）
+    mechanics_trigger_phi_max_delta: float = 0.0
+    mechanics_trigger_eta_max_delta: float = 0.0
 
 
 @dataclass

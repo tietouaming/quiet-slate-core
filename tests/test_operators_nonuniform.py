@@ -60,3 +60,17 @@ def test_nonuniform_laplacian_second_order_trend() -> None:
     assert e1 > e2
     assert (e1 / max(e2, 1e-16)) > 2.2
 
+
+def test_uniform_neumann_boundary_zero_normal_gradient() -> None:
+    """均匀网格 Neumann 边界下，边界法向梯度应接近 0。"""
+    torch.manual_seed(0)
+    u = torch.rand((1, 1, 33, 49), dtype=torch.float64)
+    gx, gy = grad_xy(u, dx=1.0, dy=1.0, bc="neumann")
+    left = torch.max(torch.abs(gx[:, :, :, 0])).item()
+    right = torch.max(torch.abs(gx[:, :, :, -1])).item()
+    bottom = torch.max(torch.abs(gy[:, :, 0, :])).item()
+    top = torch.max(torch.abs(gy[:, :, -1, :])).item()
+    assert left < 1e-12
+    assert right < 1e-12
+    assert bottom < 1e-12
+    assert top < 1e-12

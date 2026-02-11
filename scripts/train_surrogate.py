@@ -168,7 +168,11 @@ def _smooth_heaviside(phi: torch.Tensor) -> torch.Tensor:
 
 def _grad_xy_center(x: torch.Tensor, dx: float, dy: float) -> Tuple[torch.Tensor, torch.Tensor]:
     """中心差分梯度（训练阶段物理残差近似）。"""
-    xp = F.pad(x, (1, 1, 1, 1), mode="replicate")
+    # 与主求解器默认 Neumann 边界一致：reflect 对中心差分对应零法向梯度。
+    if x.shape[-2] < 2 or x.shape[-1] < 2:
+        xp = F.pad(x, (1, 1, 1, 1), mode="replicate")
+    else:
+        xp = F.pad(x, (1, 1, 1, 1), mode="reflect")
     gx = (xp[:, :, 1:-1, 2:] - xp[:, :, 1:-1, :-2]) / (2.0 * dx)
     gy = (xp[:, :, 2:, 1:-1] - xp[:, :, :-2, 1:-1]) / (2.0 * dy)
     return gx, gy
@@ -176,8 +180,14 @@ def _grad_xy_center(x: torch.Tensor, dx: float, dy: float) -> Tuple[torch.Tensor
 
 def _div_center(gx: torch.Tensor, gy: torch.Tensor, dx: float, dy: float) -> Tuple[torch.Tensor, torch.Tensor]:
     """中心差分散度（分别返回 x/y 分量散度对应项）。"""
-    gxp = F.pad(gx, (1, 1, 1, 1), mode="replicate")
-    gyp = F.pad(gy, (1, 1, 1, 1), mode="replicate")
+    if gx.shape[-2] < 2 or gx.shape[-1] < 2:
+        gxp = F.pad(gx, (1, 1, 1, 1), mode="replicate")
+    else:
+        gxp = F.pad(gx, (1, 1, 1, 1), mode="reflect")
+    if gy.shape[-2] < 2 or gy.shape[-1] < 2:
+        gyp = F.pad(gy, (1, 1, 1, 1), mode="replicate")
+    else:
+        gyp = F.pad(gy, (1, 1, 1, 1), mode="reflect")
     d_gx_dx = (gxp[:, :, 1:-1, 2:] - gxp[:, :, 1:-1, :-2]) / (2.0 * dx)
     d_gy_dy = (gyp[:, :, 2:, 1:-1] - gyp[:, :, :-2, 1:-1]) / (2.0 * dy)
     return d_gx_dx, d_gy_dy

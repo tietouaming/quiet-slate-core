@@ -15,16 +15,33 @@ import torch
 import torch.nn.functional as F
 
 
-def _pad_rep(x: torch.Tensor) -> torch.Tensor:
-    """复制边界填充，便于中心差分在边缘点稳定计算。"""
-    return F.pad(x, (1, 1, 1, 1), mode="replicate")
+def _pad_with_bc(x: torch.Tensor, bc: str = "neumann", dirichlet_value: float = 0.0) -> torch.Tensor:
+    """按边界条件填充 ghost 区域。"""
+    b = str(bc).strip().lower()
+    if b in {"neumann", "zero_flux", "zero-gradient", "zero_gradient"}:
+        # reflect 对中心差分等价于零法向梯度 ghost cell。
+        if x.shape[-2] < 2 or x.shape[-1] < 2:
+            return F.pad(x, (1, 1, 1, 1), mode="replicate")
+        return F.pad(x, (1, 1, 1, 1), mode="reflect")
+    if b in {"periodic", "circular"}:
+        return F.pad(x, (1, 1, 1, 1), mode="circular")
+    if b in {"dirichlet0", "dirichlet", "fixed0"}:
+        return F.pad(x, (1, 1, 1, 1), mode="constant", value=float(dirichlet_value))
+    raise ValueError(f"Unsupported boundary condition: {bc}")
 
 
-def _deriv_x(x: torch.Tensor, dx: float, x_coords: torch.Tensor | None = None) -> torch.Tensor:
+def _deriv_x(
+    x: torch.Tensor,
+    dx: float,
+    x_coords: torch.Tensor | None = None,
+    *,
+    bc: str = "neumann",
+    dirichlet_value: float = 0.0,
+) -> torch.Tensor:
     """计算 x 方向一阶导数；可选非均匀坐标。"""
     if x_coords is None:
         # 均匀网格：标准中心差分。
-        xp = _pad_rep(x)
+        xp = _pad_with_bc(x, bc=bc, dirichlet_value=dirichlet_value)
         return (xp[:, :, 1:-1, 2:] - xp[:, :, 1:-1, :-2]) / (2.0 * dx)
 
     # 非均匀网格：三点二阶格式（内点）+ 一侧二阶格式（边界）。
@@ -62,14 +79,25 @@ def _deriv_x(x: torch.Tensor, dx: float, x_coords: torch.Tensor | None = None) -
     cm2 = -(h1n + h2n) / (h1n * h2n)
     cm1 = (2.0 * h2n + h1n) / (h2n * (h1n + h2n))
     out[:, :, :, -1] = cm3 * x[:, :, :, -3] + cm2 * x[:, :, :, -2] + cm1 * x[:, :, :, -1]
+    # 非均匀网格边界若采用零通量，直接将边界法向梯度设为 0，避免伪通量泄漏。
+    if str(bc).strip().lower() in {"neumann", "zero_flux", "zero-gradient", "zero_gradient"}:
+        out[:, :, :, 0] = 0.0
+        out[:, :, :, -1] = 0.0
     return out
 
 
-def _deriv_y(x: torch.Tensor, dy: float, y_coords: torch.Tensor | None = None) -> torch.Tensor:
+def _deriv_y(
+    x: torch.Tensor,
+    dy: float,
+    y_coords: torch.Tensor | None = None,
+    *,
+    bc: str = "neumann",
+    dirichlet_value: float = 0.0,
+) -> torch.Tensor:
     """计算 y 方向一阶导数；可选非均匀坐标。"""
     if y_coords is None:
         # 均匀网格：标准中心差分。
-        xp = _pad_rep(x)
+        xp = _pad_with_bc(x, bc=bc, dirichlet_value=dirichlet_value)
         return (xp[:, :, 2:, 1:-1] - xp[:, :, :-2, 1:-1]) / (2.0 * dy)
 
     # 非均匀网格：三点二阶格式（内点）+ 一侧二阶格式（边界）。
@@ -107,13 +135,23 @@ def _deriv_y(x: torch.Tensor, dy: float, y_coords: torch.Tensor | None = None) -
     cm2 = -(h1n + h2n) / (h1n * h2n)
     cm1 = (2.0 * h2n + h1n) / (h2n * (h1n + h2n))
     out[:, :, -1, :] = cm3 * x[:, :, -3, :] + cm2 * x[:, :, -2, :] + cm1 * x[:, :, -1, :]
+    if str(bc).strip().lower() in {"neumann", "zero_flux", "zero-gradient", "zero_gradient"}:
+        out[:, :, 0, :] = 0.0
+        out[:, :, -1, :] = 0.0
     return out
 
 
-def _second_deriv_x(x: torch.Tensor, dx: float, x_coords: torch.Tensor | None = None) -> torch.Tensor:
+def _second_deriv_x(
+    x: torch.Tensor,
+    dx: float,
+    x_coords: torch.Tensor | None = None,
+    *,
+    bc: str = "neumann",
+    dirichlet_value: float = 0.0,
+) -> torch.Tensor:
     """计算 x 方向二阶导数；非均匀网格采用三点二阶公式。"""
     if x_coords is None:
-        xp = _pad_rep(x)
+        xp = _pad_with_bc(x, bc=bc, dirichlet_value=dirichlet_value)
         return (xp[:, :, 1:-1, 2:] - 2.0 * xp[:, :, 1:-1, 1:-1] + xp[:, :, 1:-1, :-2]) / (dx * dx)
 
     eps = 1e-12
@@ -134,10 +172,17 @@ def _second_deriv_x(x: torch.Tensor, dx: float, x_coords: torch.Tensor | None = 
     return out
 
 
-def _second_deriv_y(x: torch.Tensor, dy: float, y_coords: torch.Tensor | None = None) -> torch.Tensor:
+def _second_deriv_y(
+    x: torch.Tensor,
+    dy: float,
+    y_coords: torch.Tensor | None = None,
+    *,
+    bc: str = "neumann",
+    dirichlet_value: float = 0.0,
+) -> torch.Tensor:
     """计算 y 方向二阶导数；非均匀网格采用三点二阶公式。"""
     if y_coords is None:
-        xp = _pad_rep(x)
+        xp = _pad_with_bc(x, bc=bc, dirichlet_value=dirichlet_value)
         return (xp[:, :, 2:, 1:-1] - 2.0 * xp[:, :, 1:-1, 1:-1] + xp[:, :, :-2, 1:-1]) / (dy * dy)
 
     eps = 1e-12
@@ -164,9 +209,14 @@ def grad_xy(
     *,
     x_coords: torch.Tensor | None = None,
     y_coords: torch.Tensor | None = None,
+    bc: str = "neumann",
+    dirichlet_value: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """返回二维梯度 `(∂x, ∂y)`。"""
-    return _deriv_x(x, dx, x_coords), _deriv_y(x, dy, y_coords)
+    return (
+        _deriv_x(x, dx, x_coords, bc=bc, dirichlet_value=dirichlet_value),
+        _deriv_y(x, dy, y_coords, bc=bc, dirichlet_value=dirichlet_value),
+    )
 
 
 def divergence(
@@ -177,9 +227,13 @@ def divergence(
     *,
     x_coords: torch.Tensor | None = None,
     y_coords: torch.Tensor | None = None,
+    bc: str = "neumann",
+    dirichlet_value: float = 0.0,
 ) -> torch.Tensor:
     """返回散度 `∂x(gx) + ∂y(gy)`。"""
-    return _deriv_x(gx, dx, x_coords) + _deriv_y(gy, dy, y_coords)
+    return _deriv_x(gx, dx, x_coords, bc=bc, dirichlet_value=dirichlet_value) + _deriv_y(
+        gy, dy, y_coords, bc=bc, dirichlet_value=dirichlet_value
+    )
 
 
 def laplacian(
@@ -189,10 +243,12 @@ def laplacian(
     *,
     x_coords: torch.Tensor | None = None,
     y_coords: torch.Tensor | None = None,
+    bc: str = "neumann",
+    dirichlet_value: float = 0.0,
 ) -> torch.Tensor:
     """返回拉普拉斯 `∇²x`。"""
-    dxx = _second_deriv_x(x, dx, x_coords=x_coords)
-    dyy = _second_deriv_y(x, dy, y_coords=y_coords)
+    dxx = _second_deriv_x(x, dx, x_coords=x_coords, bc=bc, dirichlet_value=dirichlet_value)
+    dyy = _second_deriv_y(x, dy, y_coords=y_coords, bc=bc, dirichlet_value=dirichlet_value)
     return dxx + dyy
 
 

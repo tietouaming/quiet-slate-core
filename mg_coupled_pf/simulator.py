@@ -206,6 +206,9 @@ class CoupledSimulator:
             "ml_rollout_increase": 0,
             "ml_rollout_decrease": 0,
         }
+        # 力学自适应触发参考态：记录上次力学求解对应的微结构。
+        self._last_mech_phi = self.state["phi"].clone()
+        self._last_mech_eta = self.state["eta"].clone()
 
     def _build_area_weights(self, x_coords_um: torch.Tensor, y_coords_um: torch.Tensor) -> torch.Tensor:
         """构造面积加权矩阵，用于非均匀网格上的加权平均。"""
@@ -285,6 +288,7 @@ class CoupledSimulator:
 
     def _compute_mechanics_residual(self, mech_state: Dict[str, torch.Tensor], phi: torch.Tensor) -> float:
         """计算 `div(sigma)=0` 的离散残差均值（仅固相统计）。"""
+        bc = self._scalar_bc()
         res_x = divergence(
             mech_state["sigma_xx"],
             mech_state["sigma_xy"],
@@ -292,6 +296,7 @@ class CoupledSimulator:
             self.dy_um,
             x_coords=self.x_coords_um,
             y_coords=self.y_coords_um,
+            bc=bc,
         )
         res_y = divergence(
             mech_state["sigma_xy"],
@@ -300,6 +305,7 @@ class CoupledSimulator:
             self.dy_um,
             x_coords=self.x_coords_um,
             y_coords=self.y_coords_um,
+            bc=bc,
         )
         solid = solid_indicator(phi, self.cfg.domain.solid_phase_threshold)
         return 0.5 * (
@@ -309,6 +315,7 @@ class CoupledSimulator:
 
     def _compute_free_energy(self, state: Dict[str, torch.Tensor], mech_state: Dict[str, torch.Tensor]) -> float:
         """计算离散总自由能密度（面积加权平均）。"""
+        bc = self._scalar_bc()
         phi = torch.clamp(state["phi"], 0.0, 1.0)
         cbar = torch.clamp(state["c"], self.cfg.corrosion.cMg_min, self.cfg.corrosion.cMg_max)
         eta = torch.clamp(state["eta"], 0.0, 1.0)
@@ -326,6 +333,7 @@ class CoupledSimulator:
             self.dy_m,
             x_coords=self.x_coords_m,
             y_coords=self.y_coords_m,
+            bc=bc,
         )
         grad_phi = 0.5 * kappa_phi * (gx_phi * gx_phi + gy_phi * gy_phi)
         eta_barrier = hphi * self.cfg.twinning.W_barrier_MPa * eta * eta * (1.0 - eta) * (1.0 - eta)
@@ -335,6 +343,7 @@ class CoupledSimulator:
             self.dy_um,
             x_coords=self.x_coords_um,
             y_coords=self.y_coords_um,
+            bc=bc,
         )
         if self.cfg.twinning.scale_twin_gradient_by_hphi:
             grad_coef_eta = self.cfg.twinning.kappa_eta * hphi
@@ -360,6 +369,7 @@ class CoupledSimulator:
         dt_s: float,
     ) -> Dict[str, float]:
         """计算 surrogate 候选状态的离散 PDE 残差。"""
+        bc = self._scalar_bc()
         dt = max(float(dt_s), 1e-12)
         phi = torch.clamp(nxt["phi"], 0.0, 1.0)
         cbar = torch.clamp(nxt["c"], self.cfg.corrosion.cMg_min, self.cfg.corrosion.cMg_max)
@@ -388,26 +398,19 @@ class CoupledSimulator:
                 self.dy_um,
                 x_coords=self.x_coords_um,
                 y_coords=self.y_coords_um,
+                bc=bc,
             )
             twin_grad_e = 0.5 * self.cfg.twinning.kappa_eta * (gx_eta_um * gx_eta_um + gy_eta_um * gy_eta_um)
             phi_nonlin = phi_nonlin - hphi_d * twin_grad_e
         L_phi = self._corrosion_mobility(state=nxt, mech=mech_state)
-        gx_phi_impl, gy_phi_impl = grad_xy(
+        phi_diff = self._div_diffusive_fv(
             phi,
-            self.dx_m,
-            self.dy_m,
+            kappa_phi * torch.clamp(L_phi, min=0.0),
+            dx=self.dx_m,
+            dy=self.dy_m,
             x_coords=self.x_coords_m,
             y_coords=self.y_coords_m,
-        )
-        diff_phi_x = kappa_phi * L_phi * gx_phi_impl
-        diff_phi_y = kappa_phi * L_phi * gy_phi_impl
-        phi_diff = divergence(
-            diff_phi_x,
-            diff_phi_y,
-            self.dx_m,
-            self.dy_m,
-            x_coords=self.x_coords_m,
-            y_coords=self.y_coords_m,
+            bc=bc,
         )
         r_phi = (phi - prev["phi"]) / dt + L_phi * phi_nonlin - phi_diff
         pde_phi = self._masked_mean_abs(r_phi)
@@ -415,7 +418,14 @@ class CoupledSimulator:
         hphi_c = smooth_heaviside(phi)
         hphi_d_c = smooth_heaviside_prime(phi)
         D = self.cfg.corrosion.D_s_m2_s * hphi_c + (1.0 - hphi_c) * self.cfg.corrosion.D_l_m2_s
-        gx_phi, gy_phi = grad_xy(phi, self.dx_m, self.dy_m, x_coords=self.x_coords_m, y_coords=self.y_coords_m)
+        gx_phi, gy_phi = grad_xy(
+            phi,
+            self.dx_m,
+            self.dy_m,
+            x_coords=self.x_coords_m,
+            y_coords=self.y_coords_m,
+            bc=bc,
+        )
         corr = hphi_d_c * (cl_eq - cs_eq)
         rhs_c = self._diffusion_rhs(
             cbar,
@@ -444,20 +454,14 @@ class CoupledSimulator:
         act = torch.relu(torch.abs(tau_tw) - self.cfg.twinning.twin_crss_MPa)
         langevin = hphi * self.cfg.twinning.langevin_nucleation_noise * nuc * act
         eta_source = twin_dw - tw_drive - langevin
-        gx_eta, gy_eta = grad_xy(
+        grad_term = self._div_diffusive_fv(
             eta,
-            self.dx_um,
-            self.dy_um,
+            torch.clamp(grad_coef_eta, min=0.0),
+            dx=self.dx_um,
+            dy=self.dy_um,
             x_coords=self.x_coords_um,
             y_coords=self.y_coords_um,
-        )
-        grad_term = divergence(
-            grad_coef_eta * gx_eta,
-            grad_coef_eta * gy_eta,
-            self.dx_um,
-            self.dy_um,
-            x_coords=self.x_coords_um,
-            y_coords=self.y_coords_um,
+            bc=bc,
         )
         r_eta = (eta - prev["eta"]) / dt + self.cfg.twinning.L_eta * (eta_source - grad_term)
         solid = solid_indicator(phi, self.cfg.domain.solid_phase_threshold)
@@ -598,6 +602,125 @@ class CoupledSimulator:
         self._diffusion_stage_cache[key] = best
         return best
 
+    def _scalar_bc(self) -> str:
+        """返回标量场离散边界条件。"""
+        return str(getattr(self.cfg.numerics, "scalar_bc", "neumann")).strip().lower()
+
+    def _axis_metrics(
+        self,
+        n: int,
+        d_default: float,
+        coords: torch.Tensor | None,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """构造面间距与控制体宽度。"""
+        if n <= 1:
+            face = torch.full((1,), max(float(d_default), 1e-12), device=device, dtype=dtype)
+            cell = torch.full((1,), max(float(d_default), 1e-12), device=device, dtype=dtype)
+            return face, cell
+        if coords is None:
+            d = max(float(d_default), 1e-12)
+            face = torch.full((n - 1,), d, device=device, dtype=dtype)
+            cell = torch.full((n,), d, device=device, dtype=dtype)
+            return face, cell
+        face = torch.clamp(coords[1:] - coords[:-1], min=1e-12).to(device=device, dtype=dtype)
+        cell = torch.zeros((n,), device=device, dtype=dtype)
+        cell[0] = 0.5 * face[0]
+        cell[-1] = 0.5 * face[-1]
+        if n > 2:
+            cell[1:-1] = 0.5 * (face[1:] + face[:-1])
+        return face, cell
+
+    def _div_diffusive_fv(
+        self,
+        u: torch.Tensor,
+        diff_coef: torch.Tensor,
+        *,
+        dx: float,
+        dy: float,
+        x_coords: torch.Tensor | None,
+        y_coords: torch.Tensor | None,
+        bc: str | None = None,
+    ) -> torch.Tensor:
+        """有限体积守恒离散：返回 `div(diff_coef * grad(u))`。"""
+        b = self._scalar_bc() if bc is None else str(bc).strip().lower()
+        eps = 1e-12
+        B, C, H, W = u.shape
+        if H < 2 or W < 2:
+            return torch.zeros_like(u)
+
+        # 周期边界在非均匀网格下未实现，避免误用。
+        if b in {"periodic", "circular"}:
+            if x_coords is not None and x_coords.numel() > 2:
+                dxv = x_coords[1:] - x_coords[:-1]
+                if float(torch.max(torch.abs(dxv - dxv[0])).item()) > 1e-12:
+                    raise ValueError("periodic scalar_bc is only supported on uniform x grid.")
+            if y_coords is not None and y_coords.numel() > 2:
+                dyv = y_coords[1:] - y_coords[:-1]
+                if float(torch.max(torch.abs(dyv - dyv[0])).item()) > 1e-12:
+                    raise ValueError("periodic scalar_bc is only supported on uniform y grid.")
+
+        fx, cx = self._axis_metrics(W, dx, x_coords, dtype=u.dtype, device=u.device)
+        fy, cy = self._axis_metrics(H, dy, y_coords, dtype=u.dtype, device=u.device)
+        fx = fx.view(1, 1, 1, -1)
+        cx = cx.view(1, 1, 1, -1)
+        fy = fy.view(1, 1, -1, 1)
+        cy = cy.view(1, 1, -1, 1)
+
+        d = torch.clamp(diff_coef, min=0.0)
+        if b in {"periodic", "circular"}:
+            d_xf = 2.0 * d * torch.roll(d, shifts=-1, dims=3) / torch.clamp(d + torch.roll(d, shifts=-1, dims=3), min=eps)
+            d_yf = 2.0 * d * torch.roll(d, shifts=-1, dims=2) / torch.clamp(d + torch.roll(d, shifts=-1, dims=2), min=eps)
+            flux_x_out = -d_xf * (torch.roll(u, shifts=-1, dims=3) - u) / max(float(dx), eps)
+            flux_y_out = -d_yf * (torch.roll(u, shifts=-1, dims=2) - u) / max(float(dy), eps)
+            div_x = (flux_x_out - torch.roll(flux_x_out, shifts=1, dims=3)) / cx
+            div_y = (flux_y_out - torch.roll(flux_y_out, shifts=1, dims=2)) / cy
+            return torch.nan_to_num(div_x + div_y, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Neumann/Dirichlet0: 先组装内部面通量，再做控制体通量差。
+        d_xf = 2.0 * d[:, :, :, 1:] * d[:, :, :, :-1] / torch.clamp(d[:, :, :, 1:] + d[:, :, :, :-1], min=eps)
+        d_yf = 2.0 * d[:, :, 1:, :] * d[:, :, :-1, :] / torch.clamp(d[:, :, 1:, :] + d[:, :, :-1, :], min=eps)
+        flux_x = -d_xf * (u[:, :, :, 1:] - u[:, :, :, :-1]) / fx
+        flux_y = -d_yf * (u[:, :, 1:, :] - u[:, :, :-1, :]) / fy
+
+        div_x = torch.zeros_like(u)
+        div_y = torch.zeros_like(u)
+        if b in {"dirichlet0", "dirichlet", "fixed0"}:
+            # 边界面值固定为 0 时，边界通量按单边差商计算。
+            d_l = d[:, :, :, 0]
+            d_r = d[:, :, :, -1]
+            fx0 = cx[:, :, :, 0]
+            fxn = cx[:, :, :, -1]
+            flux_left = -d_l * (u[:, :, :, 0] - 0.0) / torch.clamp(fx0, min=eps)
+            flux_right = -d_r * (0.0 - u[:, :, :, -1]) / torch.clamp(fxn, min=eps)
+            div_x[:, :, :, 0] = (flux_x[:, :, :, 0] - flux_left) / torch.clamp(cx[:, :, :, 0], min=eps)
+            div_x[:, :, :, -1] = (flux_right - flux_x[:, :, :, -1]) / torch.clamp(cx[:, :, :, -1], min=eps)
+        else:
+            # Neumann 零通量：边界外侧面通量为 0。
+            div_x[:, :, :, 0] = flux_x[:, :, :, 0] / torch.clamp(cx[:, :, :, 0], min=eps)
+            div_x[:, :, :, -1] = -flux_x[:, :, :, -1] / torch.clamp(cx[:, :, :, -1], min=eps)
+        if W > 2:
+            div_x[:, :, :, 1:-1] = (flux_x[:, :, :, 1:] - flux_x[:, :, :, :-1]) / torch.clamp(cx[:, :, :, 1:-1], min=eps)
+
+        if b in {"dirichlet0", "dirichlet", "fixed0"}:
+            d_b = d[:, :, 0, :]
+            d_t = d[:, :, -1, :]
+            fy0 = cy[:, :, 0, :]
+            fyn = cy[:, :, -1, :]
+            flux_bottom = -d_b * (u[:, :, 0, :] - 0.0) / torch.clamp(fy0, min=eps)
+            flux_top = -d_t * (0.0 - u[:, :, -1, :]) / torch.clamp(fyn, min=eps)
+            div_y[:, :, 0, :] = (flux_y[:, :, 0, :] - flux_bottom) / torch.clamp(cy[:, :, 0, :], min=eps)
+            div_y[:, :, -1, :] = (flux_top - flux_y[:, :, -1, :]) / torch.clamp(cy[:, :, -1, :], min=eps)
+        else:
+            div_y[:, :, 0, :] = flux_y[:, :, 0, :] / torch.clamp(cy[:, :, 0, :], min=eps)
+            div_y[:, :, -1, :] = -flux_y[:, :, -1, :] / torch.clamp(cy[:, :, -1, :], min=eps)
+        if H > 2:
+            div_y[:, :, 1:-1, :] = (flux_y[:, :, 1:, :] - flux_y[:, :, :-1, :]) / torch.clamp(cy[:, :, 1:-1, :], min=eps)
+
+        return torch.nan_to_num(div_x + div_y, nan=0.0, posinf=0.0, neginf=0.0)
+
     def _diffusion_rhs(
         self,
         c_field: torch.Tensor,
@@ -610,9 +733,19 @@ class CoupledSimulator:
         mech_for_coupler: Dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """扩散方程右端项。"""
-        gx_c, gy_c = grad_xy(c_field, self.dx_m, self.dy_m, x_coords=self.x_coords_m, y_coords=self.y_coords_m)
-        jx = -D * (gx_c + corr * gx_phi)
-        jy = -D * (gy_c + corr * gy_phi)
+        bc = self._scalar_bc()
+        # 主扩散项采用守恒 finite-volume 离散，减少边界伪通量与非对称误差。
+        diff_term = self._div_diffusive_fv(
+            c_field,
+            D,
+            dx=self.dx_m,
+            dy=self.dy_m,
+            x_coords=self.x_coords_m,
+            y_coords=self.y_coords_m,
+            bc=bc,
+        )
+        jx = -D * (corr * gx_phi)
+        jy = -D * (corr * gy_phi)
         if self.couplers:
             state_tmp = dict(self.state if state_for_coupler is None else state_for_coupler)
             state_tmp["phi"] = phi_for_state
@@ -622,13 +755,14 @@ class CoupledSimulator:
                 ex, ey = cp.concentration_drift_flux(state_tmp, aux)
                 jx = jx + ex
                 jy = jy + ey
-        rhs = -divergence(
+        rhs = diff_term - divergence(
             jx,
             jy,
             self.dx_m,
             self.dy_m,
             x_coords=self.x_coords_m,
             y_coords=self.y_coords_m,
+            bc=bc,
         )
         return torch.nan_to_num(rhs, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -696,6 +830,7 @@ class CoupledSimulator:
         a = max(float(alpha), 0.0)
         if a <= 0.0:
             return rhs
+        bc = self._scalar_bc()
 
         inv_diag = 1.0 / (1.0 + a * (2.0 / max(dx * dx, 1e-20) + 2.0 / max(dy * dy, 1e-20)))
         diag_inv = torch.full_like(rhs, fill_value=float(inv_diag))
@@ -707,6 +842,7 @@ class CoupledSimulator:
                 dy,
                 x_coords=x_coords,
                 y_coords=y_coords,
+                bc=bc,
             )
 
         return self._pcg_scalar(apply_A, rhs, x0=x0, diag_inv=diag_inv)
@@ -727,21 +863,28 @@ class CoupledSimulator:
         c = max(float(coeff), 0.0)
         if c <= 0.0:
             return rhs
-        diag_lap = 2.0 / max(dx * dx, 1e-20) + 2.0 / max(dy * dy, 1e-20)
+        bc = self._scalar_bc()
+        if x_coords is not None and x_coords.numel() > 1:
+            dx_eff = float(torch.min(x_coords[1:] - x_coords[:-1]).item())
+        else:
+            dx_eff = float(dx)
+        if y_coords is not None and y_coords.numel() > 1:
+            dy_eff = float(torch.min(y_coords[1:] - y_coords[:-1]).item())
+        else:
+            dy_eff = float(dy)
+        diag_lap = 2.0 / max(dx_eff * dx_eff, 1e-20) + 2.0 / max(dy_eff * dy_eff, 1e-20)
         diag_inv = 1.0 / (1.0 + c * torch.clamp(diff_coef, min=0.0) * diag_lap)
         diag_inv = torch.clamp(torch.nan_to_num(diag_inv, nan=1.0, posinf=1.0, neginf=1.0), min=1e-8, max=1e8)
 
         def apply_A(u: torch.Tensor) -> torch.Tensor:
-            gux, guy = grad_xy(u, dx, dy, x_coords=x_coords, y_coords=y_coords)
-            diff_flux_x = diff_coef * gux
-            diff_flux_y = diff_coef * guy
-            return u - c * divergence(
-                diff_flux_x,
-                diff_flux_y,
-                dx,
-                dy,
+            return u - c * self._div_diffusive_fv(
+                u,
+                diff_coef,
+                dx=dx,
+                dy=dy,
                 x_coords=x_coords,
                 y_coords=y_coords,
+                bc=bc,
             )
 
         return self._pcg_scalar(apply_A, rhs, x0=x0, diag_inv=diag_inv)
@@ -1023,8 +1166,20 @@ class CoupledSimulator:
         """执行纯物理时间步推进。"""
         # 1) 力学 + 晶体塑性（可多速率更新）
         mech_every = max(1, int(self.cfg.numerics.mechanics_update_every))
-        # 仅在指定频率点更新力学，可在稳定阶段降低力学开销。
-        do_mech_update = step_idx <= 1 or (step_idx % mech_every == 0)
+        periodic_due = step_idx <= 1 or (step_idx % mech_every == 0)
+        # 自适应触发：当微结构变化超阈值时，提前刷新力学场，避免滞后应力驱动误判。
+        phi_trig = max(float(getattr(self.cfg.numerics, "mechanics_trigger_phi_max_delta", 0.0)), 0.0)
+        eta_trig = max(float(getattr(self.cfg.numerics, "mechanics_trigger_eta_max_delta", 0.0)), 0.0)
+        adaptive_due = False
+        if not periodic_due:
+            if phi_trig > 0.0:
+                dphi = float(torch.max(torch.abs(self.state["phi"] - self._last_mech_phi)).item())
+                adaptive_due = adaptive_due or (dphi > phi_trig)
+            if eta_trig > 0.0:
+                deta = float(torch.max(torch.abs(self.state["eta"] - self._last_mech_eta)).item())
+                adaptive_due = adaptive_due or (deta > eta_trig)
+        # 仅在指定频率点或触发阈值满足时更新力学。
+        do_mech_update = periodic_due or adaptive_due
         if do_mech_update:
             if bool(self.cfg.numerics.mechanics_use_ml_initial_guess) and self.surrogate is not None:
                 # 可选：用 surrogate 位移场作为力学迭代初值（仅作初值，不替代物理求解）。
@@ -1102,6 +1257,8 @@ class CoupledSimulator:
                 # 若本步纯弹性，直接复用预测力学结果。
                 self.last_mech = mech_predict
                 self.stats["mech_correct_skipped_elastic"] += 1
+            self._last_mech_phi = self.state["phi"].clone()
+            self._last_mech_eta = self.state["eta"].clone()
 
         # 无论力学本步是否更新，都保持 state 与内部塑性张量同步。
         self._sync_epsp_to_state()
@@ -1110,6 +1267,7 @@ class CoupledSimulator:
         phi = self.state["phi"]
         cbar = self.state["c"]
         eta = self.state["eta"]
+        bc = self._scalar_bc()
         hphi = smooth_heaviside(phi)
         hphi_d = smooth_heaviside_prime(phi)
 
@@ -1139,6 +1297,7 @@ class CoupledSimulator:
                 self.dy_um,
                 x_coords=self.x_coords_um,
                 y_coords=self.y_coords_um,
+                bc=bc,
             )
             twin_grad_e = 0.5 * self.cfg.twinning.kappa_eta * (gx_eta_um * gx_eta_um + gy_eta_um * gy_eta_um)
             phi_nonlin = phi_nonlin - hphi_d * twin_grad_e
@@ -1161,20 +1320,14 @@ class CoupledSimulator:
                 x0=phi,
             )
         else:
-            gx_phi_impl, gy_phi_impl = grad_xy(
+            phi_diff = self._div_diffusive_fv(
                 phi,
-                self.dx_m,
-                self.dy_m,
+                kappa_phi * torch.clamp(L_phi, min=0.0),
+                dx=self.dx_m,
+                dy=self.dy_m,
                 x_coords=self.x_coords_m,
                 y_coords=self.y_coords_m,
-            )
-            phi_diff = divergence(
-                kappa_phi * torch.clamp(L_phi, min=0.0) * gx_phi_impl,
-                kappa_phi * torch.clamp(L_phi, min=0.0) * gy_phi_impl,
-                self.dx_m,
-                self.dy_m,
-                x_coords=self.x_coords_m,
-                y_coords=self.y_coords_m,
+                bc=bc,
             )
             phi_rhs = -L_phi * phi_nonlin + phi_diff
             phi_rhs = torch.nan_to_num(phi_rhs, nan=0.0, posinf=0.0, neginf=0.0)
@@ -1189,25 +1342,28 @@ class CoupledSimulator:
         hphi_d_c = smooth_heaviside_prime(phi_c)
         D = self.cfg.corrosion.D_s_m2_s * hphi_c + (1.0 - hphi_c) * self.cfg.corrosion.D_l_m2_s
         # 耦合修正项：由相场梯度导致的平衡浓度梯度贡献。
-        gx_phi, gy_phi = grad_xy(phi_c, self.dx_m, self.dy_m, x_coords=self.x_coords_m, y_coords=self.y_coords_m)
+        gx_phi, gy_phi = grad_xy(
+            phi_c,
+            self.dx_m,
+            self.dy_m,
+            x_coords=self.x_coords_m,
+            y_coords=self.y_coords_m,
+            bc=bc,
+        )
         corr = hphi_d_c * (cl_eq - cs_eq)
         stage_dts = self._diffusion_stage_dts(dt_s)
         c_tmp = cbar
         for dt_stage in stage_dts:
-            # STS / 子循环阶段推进：每个子阶段都做裁剪与 NaN 防护。
+            # STS / 子循环阶段推进：阶段内不做硬截断，减少对动力学的投影篡改。
             rhs_c = self._diffusion_rhs(c_tmp, D, corr, gx_phi, gy_phi, phi_c)
-            c_tmp = torch.clamp(
-                c_tmp + float(dt_stage) * rhs_c,
-                min=self.cfg.corrosion.cMg_min,
-                max=self.cfg.corrosion.cMg_max,
-            )
+            c_tmp = c_tmp + float(dt_stage) * rhs_c
             c_tmp = torch.nan_to_num(
                 c_tmp,
                 nan=cl_eq,
                 posinf=self.cfg.corrosion.cMg_max,
                 neginf=self.cfg.corrosion.cMg_min,
             )
-        c_new = c_tmp
+        c_new = torch.clamp(c_tmp, min=self.cfg.corrosion.cMg_min, max=self.cfg.corrosion.cMg_max)
 
         # 孪晶 TDGL 方程推进。
         heta = smooth_heaviside(eta)
@@ -1245,14 +1401,14 @@ class CoupledSimulator:
                 x0=eta,
             )
         else:
-            gx_eta, gy_eta = grad_xy(eta, self.dx_um, self.dy_um, x_coords=self.x_coords_um, y_coords=self.y_coords_um)
-            grad_term = divergence(
-                grad_coef_eta * gx_eta,
-                grad_coef_eta * gy_eta,
-                self.dx_um,
-                self.dy_um,
+            grad_term = self._div_diffusive_fv(
+                eta,
+                torch.clamp(grad_coef_eta, min=0.0),
+                dx=self.dx_um,
+                dy=self.dy_um,
                 x_coords=self.x_coords_um,
                 y_coords=self.y_coords_um,
+                bc=bc,
             )
             eta_rhs = eta_source - grad_term
             eta_rhs = torch.nan_to_num(eta_rhs, nan=0.0, posinf=0.0, neginf=0.0)
