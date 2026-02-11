@@ -205,6 +205,11 @@ class CoupledSimulator:
             "ml_reject_uncertainty": 0,
             "ml_rollout_increase": 0,
             "ml_rollout_decrease": 0,
+            "scalar_pcg_calls": 0,
+            "scalar_pcg_converged": 0,
+            "scalar_bicgstab_calls": 0,
+            "scalar_bicgstab_converged": 0,
+            "scalar_solver_fallback": 0,
         }
         # 力学自适应触发参考态：记录上次力学求解对应的微结构。
         self._last_mech_phi = self.state["phi"].clone()
@@ -766,15 +771,15 @@ class CoupledSimulator:
         )
         return torch.nan_to_num(rhs, nan=0.0, posinf=0.0, neginf=0.0)
 
-    def _pcg_scalar(
+    def _pcg_scalar_with_info(
         self,
         apply_A,
         rhs: torch.Tensor,
         *,
         x0: torch.Tensor | None = None,
         diag_inv: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """通用标量场 PCG 迭代器（矩阵自由）。"""
+    ) -> tuple[torch.Tensor, bool, int, float]:
+        """通用标量场 PCG 迭代器（矩阵自由，含收敛信息）。"""
         if x0 is None:
             x = rhs.clone()
         else:
@@ -791,10 +796,13 @@ class CoupledSimulator:
         tol = max(abs_tol, rel_tol * float(r0.item()))
         relax = max(min(float(self.cfg.numerics.imex_relaxation), 1.0), 0.1)
         if float(r0.item()) <= tol:
-            return x
+            return x, True, 0, float(r0.item())
 
         n_iter = max(1, int(self.cfg.numerics.imex_solver_iters))
-        for _ in range(n_iter):
+        conv = False
+        it_used = 0
+        r_norm = float(r0.item())
+        for it in range(1, n_iter + 1):
             Ap = apply_A(p)
             denom = torch.sum(p * Ap)
             if torch.abs(denom).item() <= 1e-30:
@@ -802,8 +810,11 @@ class CoupledSimulator:
             alpha = rz_old / denom
             x = x + relax * alpha * p
             r = r - relax * alpha * Ap
-            r_norm = torch.sqrt(torch.clamp(torch.sum(r * r), min=0.0))
-            if float(r_norm.item()) <= tol:
+            r_norm_t = torch.sqrt(torch.clamp(torch.sum(r * r), min=0.0))
+            r_norm = float(r_norm_t.item())
+            it_used = it
+            if r_norm <= tol:
+                conv = True
                 break
             z = r if diag_inv is None else diag_inv * r
             rz_new = torch.sum(r * z)
@@ -813,7 +824,131 @@ class CoupledSimulator:
             p = z + beta * p
             rz_old = rz_new
 
-        return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0), conv, int(it_used), float(r_norm)
+
+    def _pcg_scalar(
+        self,
+        apply_A,
+        rhs: torch.Tensor,
+        *,
+        x0: torch.Tensor | None = None,
+        diag_inv: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """兼容旧调用接口：仅返回解。"""
+        x, _, _, _ = self._pcg_scalar_with_info(apply_A, rhs, x0=x0, diag_inv=diag_inv)
+        return x
+
+    def _bicgstab_scalar_with_info(
+        self,
+        apply_A,
+        rhs: torch.Tensor,
+        *,
+        x0: torch.Tensor | None = None,
+        diag_inv: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, bool, int, float]:
+        """通用标量场 BiCGStab（矩阵自由，适配非SPD场景）。"""
+        if x0 is None:
+            x = rhs.clone()
+        else:
+            x = x0.clone()
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        rhs = torch.nan_to_num(rhs, nan=0.0, posinf=0.0, neginf=0.0)
+
+        r = rhs - apply_A(x)
+        r_hat = r.clone()
+        r0 = torch.sqrt(torch.clamp(torch.sum(r * r), min=0.0))
+        abs_tol = max(float(self.cfg.numerics.imex_solver_tol_abs), 0.0)
+        rel_tol = max(float(self.cfg.numerics.imex_solver_tol_rel), 0.0)
+        tol = max(abs_tol, rel_tol * float(r0.item()))
+        if float(r0.item()) <= tol:
+            return x, True, 0, float(r0.item())
+
+        p = torch.zeros_like(r)
+        v = torch.zeros_like(r)
+        rho_old = torch.tensor(1.0, device=rhs.device, dtype=rhs.dtype)
+        alpha = torch.tensor(1.0, device=rhs.device, dtype=rhs.dtype)
+        omega = torch.tensor(1.0, device=rhs.device, dtype=rhs.dtype)
+        n_iter = max(1, int(self.cfg.numerics.imex_solver_iters))
+        conv = False
+        it_used = 0
+        r_norm = float(r0.item())
+
+        for it in range(1, n_iter + 1):
+            rho_new = torch.sum(r_hat * r)
+            if torch.abs(rho_new).item() <= 1e-30:
+                break
+            beta = (rho_new / rho_old) * (alpha / torch.clamp(omega, min=1e-30))
+            p = r + beta * (p - omega * v)
+            p_hat = p if diag_inv is None else diag_inv * p
+            v = apply_A(p_hat)
+            den = torch.sum(r_hat * v)
+            if torch.abs(den).item() <= 1e-30:
+                break
+            alpha = rho_new / den
+            s = r - alpha * v
+            s_norm_t = torch.sqrt(torch.clamp(torch.sum(s * s), min=0.0))
+            s_norm = float(s_norm_t.item())
+            if s_norm <= tol:
+                x = x + alpha * p_hat
+                conv = True
+                it_used = it
+                r_norm = s_norm
+                break
+            s_hat = s if diag_inv is None else diag_inv * s
+            t = apply_A(s_hat)
+            tt = torch.sum(t * t)
+            if torch.abs(tt).item() <= 1e-30:
+                break
+            omega = torch.sum(t * s) / tt
+            x = x + alpha * p_hat + omega * s_hat
+            r = s - omega * t
+            r_norm_t = torch.sqrt(torch.clamp(torch.sum(r * r), min=0.0))
+            r_norm = float(r_norm_t.item())
+            it_used = it
+            if r_norm <= tol:
+                conv = True
+                break
+            if torch.abs(omega).item() <= 1e-30:
+                break
+            rho_old = rho_new
+
+        return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0), conv, int(it_used), float(r_norm)
+
+    def _solve_scalar_linear(
+        self,
+        apply_A,
+        rhs: torch.Tensor,
+        *,
+        x0: torch.Tensor | None = None,
+        diag_inv: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """统一标量线性求解入口，支持 auto/pcg/bicgstab。"""
+        mode = str(getattr(self.cfg.numerics, "scalar_linear_solver", "auto")).strip().lower()
+        if mode in {"pcg"}:
+            self.stats["scalar_pcg_calls"] += 1
+            x, conv, _, _ = self._pcg_scalar_with_info(apply_A, rhs, x0=x0, diag_inv=diag_inv)
+            if conv:
+                self.stats["scalar_pcg_converged"] += 1
+            return x
+        if mode in {"bicgstab", "bicg"}:
+            self.stats["scalar_bicgstab_calls"] += 1
+            x, conv, _, _ = self._bicgstab_scalar_with_info(apply_A, rhs, x0=x0, diag_inv=diag_inv)
+            if conv:
+                self.stats["scalar_bicgstab_converged"] += 1
+            return x
+
+        # auto: 优先 PCG，失败后回退 BiCGStab。
+        self.stats["scalar_pcg_calls"] += 1
+        x_pcg, conv_pcg, _, _ = self._pcg_scalar_with_info(apply_A, rhs, x0=x0, diag_inv=diag_inv)
+        if conv_pcg:
+            self.stats["scalar_pcg_converged"] += 1
+            return x_pcg
+        self.stats["scalar_solver_fallback"] += 1
+        self.stats["scalar_bicgstab_calls"] += 1
+        x_bi, conv_bi, _, _ = self._bicgstab_scalar_with_info(apply_A, rhs, x0=x_pcg, diag_inv=diag_inv)
+        if conv_bi:
+            self.stats["scalar_bicgstab_converged"] += 1
+        return x_bi
 
     def _solve_helmholtz_imex(
         self,
@@ -845,7 +980,7 @@ class CoupledSimulator:
                 bc=bc,
             )
 
-        return self._pcg_scalar(apply_A, rhs, x0=x0, diag_inv=diag_inv)
+        return self._solve_scalar_linear(apply_A, rhs, x0=x0, diag_inv=diag_inv)
 
     def _solve_variable_diffusion_imex(
         self,
@@ -887,7 +1022,7 @@ class CoupledSimulator:
                 bc=bc,
             )
 
-        return self._pcg_scalar(apply_A, rhs, x0=x0, diag_inv=diag_inv)
+        return self._solve_scalar_linear(apply_A, rhs, x0=x0, diag_inv=diag_inv)
 
     def _pick_device(self, mode: str) -> torch.device:
         """解析设备选择策略。"""

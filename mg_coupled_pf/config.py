@@ -93,6 +93,11 @@ class NumericsConfig:
     imex_solver_tol_abs: float = 1e-8
     imex_solver_tol_rel: float = 1e-5
     imex_relaxation: float = 1.0
+    # 标量隐式线性求解器：
+    # - pcg: 仅用预条件共轭梯度
+    # - bicgstab: 仅用 BiCGStab
+    # - auto: 先 PCG，若不收敛自动回退 BiCGStab
+    scalar_linear_solver: str = "auto"
     mechanics_solver: str = "hybrid_cg_relax"
     mechanics_cg_max_iters: int = 120
     mechanics_cg_tol_abs: float = 5.0

@@ -352,3 +352,30 @@ def test_mechanics_adaptive_trigger_updates_early() -> None:
     sim._physics_step(cfg.numerics.dt_s, 2)
     n2 = sim.stats["mech_predict_solve"]
     assert n2 == n1 + 1
+
+
+def test_scalar_linear_solver_auto_fallback_to_bicgstab() -> None:
+    """auto 模式下 PCG 未收敛时应回退到 BiCGStab。"""
+    cfg = load_config("configs/notch_case.yaml")
+    cfg.runtime.device = "cpu"
+    cfg.ml.enabled = False
+    cfg.domain.nx = 24
+    cfg.domain.ny = 16
+    cfg.numerics.scalar_linear_solver = "auto"
+    cfg.numerics.imex_solver_iters = 1
+    cfg.numerics.imex_solver_tol_abs = 1e-18
+    cfg.numerics.imex_solver_tol_rel = 1e-18
+    sim = CoupledSimulator(cfg)
+
+    torch.manual_seed(2)
+    rhs = torch.rand((1, 1, 16, 24), dtype=torch.float32)
+
+    def apply_a(u: torch.Tensor) -> torch.Tensor:
+        # 构造带平流型偏置的非对称算子，降低 PCG 单步收敛概率。
+        return u + 0.3 * (torch.roll(u, shifts=-1, dims=3) - u)
+
+    x = sim._solve_scalar_linear(apply_a, rhs, x0=torch.zeros_like(rhs), diag_inv=None)
+    assert torch.isfinite(x).all()
+    assert sim.stats["scalar_pcg_calls"] >= 1
+    assert sim.stats["scalar_solver_fallback"] >= 1
+    assert sim.stats["scalar_bicgstab_calls"] >= 1
