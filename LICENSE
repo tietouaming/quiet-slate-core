@@ -1,0 +1,65 @@
+Custom Contact-and-Attribution License v1.0
+
+Copyright (c) 2026 tietouaming
+All rights reserved.
+
+This repository is publicly visible for transparency and collaboration review.
+It is NOT provided under an OSI-approved open source license.
+
+1. Definitions
+
+"Work" means all source code, scripts, models, documents, data schemas,
+configuration files, and other content in this repository.
+
+"Use" means any copying, citation, publication, redistribution, modification,
+derivative work creation, model training use, commercial use, or non-commercial
+reuse of any part of the Work.
+
+2. Default rule
+
+Except as expressly allowed below, no rights are granted to Use the Work.
+
+3. Limited permission without prior approval
+
+You may view and clone the repository for private evaluation only.
+You may not publish, cite, modify, redistribute, or use results derived from
+the Work without prior written permission from the Licensor.
+
+4. Mandatory prior contact and written permission
+
+Any citation, reuse, adaptation, modification, derivative work, redistribution,
+or integration into another project requires prior written permission from the
+Licensor.
+
+Contact:
+- GitHub: https://github.com/tietouaming
+- Email: tietouaming@163.com
+
+5. Mandatory attribution (when permission is granted)
+
+Any approved use must include clear attribution to the original author:
+- Name: tietouaming
+- Repository: https://github.com/tietouaming/quiet-slate-core
+
+Attribution must be visible in:
+- Source headers and license files for code reuse
+- README or documentation for project reuse
+- Captions/footnotes/references for papers, posts, or reports
+
+6. No sublicensing, no implied rights
+
+No sublicensing rights are granted unless explicitly stated in writing by the
+Licensor. No patent rights, trademark rights, or other implied rights are
+granted.
+
+7. Revocation
+
+Any permission granted by the Licensor may be revoked for breach of these
+terms. Upon notice of breach, all use must cease immediately.
+
+8. Disclaimer
+
+THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE,
+AND NON-INFRINGEMENT.
+

@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "Before citation, modification, or reuse, please contact the author and obtain written permission."
+title: "quiet-slate-core"
+type: software
+authors:
+  - family-names: "tietouaming"
+    given-names: "tietouaming"
+    email: "tietouaming@163.com"
+repository-code: "https://github.com/tietouaming/quiet-slate-core"
+license: "Custom-Contact-Attribution"
+abstract: >
+  Publicly visible source repository with custom terms requiring prior contact
+  and attribution for any citation, modification, or reuse.
+keywords:
+  - magnesium-alloy
+  - phase-field
+  - crystal-plasticity
+  - corrosion
+
