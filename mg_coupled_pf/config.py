@@ -117,6 +117,9 @@ class NumericsConfig:
     # 力学自适应触发阈值（当 mechanics_update_every>1 时可提前触发力学更新）
     mechanics_trigger_phi_max_delta: float = 0.0
     mechanics_trigger_eta_max_delta: float = 0.0
+    # 物理步 cMg 质量投影（在裁剪后把均值拉回参考值）。
+    concentration_mass_projection: bool = False
+    concentration_mass_projection_iters: int = 2
 
 
 @dataclass
@@ -206,6 +209,11 @@ class MechanicsConfig:
     max_abs_displacement_um: float = 0.0
     max_abs_strain: float = 0.1
     strict_solid_stress_only: bool = True
+    # 力学离散算子的边界处理（与标量场边界分离）。
+    mechanics_bc: str = "neumann"
+    # 可选按轴边界条件：若非空则覆盖 mechanics_bc。
+    mechanics_bc_x: str = ""
+    mechanics_bc_y: str = ""
 
 
 @dataclass
@@ -256,6 +264,16 @@ class MLConfig:
     uncertainty_samples: int = 3
     uncertainty_jitter_std: float = 5e-4
     uncertainty_gate: float = 2.5e-2
+    # tiny/dw 架构启用坐标通道（x/L, y/L），提升边界条件与位置感知能力。
+    surrogate_add_coord_features: bool = True
+    # surrogate 输出后强制投影位移边界约束（ux 左端固定、可选右端 Dirichlet、uy 锚点）。
+    surrogate_enforce_displacement_projection: bool = True
+    # surrogate 质量守恒门控：约束 cMg 全域平均的单步变化。
+    enable_mass_gate: bool = True
+    mass_abs_delta_max: float = 1e-4
+    mass_rel_delta_max: float = 1e-4
+    # surrogate 接受后是否做 cMg 质量投影（保持与前一步均值一致）。
+    enforce_mass_projection_on_accept: bool = False
     # 自适应 rollout：根据接受/拒绝历史动态调整 surrogate 触发频率。
     adaptive_rollout: bool = True
     rollout_min_every: int = 1

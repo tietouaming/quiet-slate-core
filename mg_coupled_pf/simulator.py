@@ -157,8 +157,15 @@ class CoupledSimulator:
                         "afno_modes_y": cfg.ml.afno_modes_y,
                         "afno_depth": cfg.ml.afno_depth,
                         "afno_expansion": cfg.ml.afno_expansion,
+                        "add_coord_features": cfg.ml.surrogate_add_coord_features,
                     },
                 )
+                self.surrogate.enforce_displacement_constraints = bool(
+                    getattr(cfg.ml, "surrogate_enforce_displacement_projection", True)
+                )
+                self.surrogate.loading_mode = str(cfg.mechanics.loading_mode)
+                self.surrogate.dirichlet_right_ux = float(self.mech._dirichlet_right_ux())
+                self.surrogate.enforce_uy_anchor = True
         self._surrogate_reject_streak = 0
         self._surrogate_pause_until_step = 0
         self._current_rollout_every = max(1, int(cfg.ml.rollout_every))
@@ -171,6 +178,7 @@ class CoupledSimulator:
             "pde_eta": 0.0,
             "pde_mech": 0.0,
             "uncertainty": 0.0,
+            "mass_delta": 0.0,
         }
 
         self.history: List[Dict[str, float]] = []
@@ -194,6 +202,7 @@ class CoupledSimulator:
             "ml_reject_phi_field_delta": 0,
             "ml_reject_eta_field_delta": 0,
             "ml_reject_c_field_delta": 0,
+            "ml_reject_mass": 0,
             "ml_reject_liquid_eta": 0,
             "ml_reject_liquid_eps": 0,
             "ml_reject_residual_gate": 0,
@@ -210,6 +219,7 @@ class CoupledSimulator:
             "scalar_bicgstab_calls": 0,
             "scalar_bicgstab_converged": 0,
             "scalar_solver_fallback": 0,
+            "mass_projection_applied": 0,
         }
         # 力学自适应触发参考态：记录上次力学求解对应的微结构。
         self._last_mech_phi = self.state["phi"].clone()
@@ -237,6 +247,28 @@ class CoupledSimulator:
     def _mean_field(self, x: torch.Tensor) -> torch.Tensor:
         """计算全域面积加权平均。"""
         return torch.sum(x * self.area_weights)
+
+    def _project_concentration_mean(
+        self,
+        c: torch.Tensor,
+        target_mean: float,
+        *,
+        cmin: float | None = None,
+        cmax: float | None = None,
+        n_iter: int = 2,
+    ) -> torch.Tensor:
+        """将浓度场均值投影到目标值（带上下界裁剪）。"""
+        lo = self.cfg.corrosion.cMg_min if cmin is None else float(cmin)
+        hi = self.cfg.corrosion.cMg_max if cmax is None else float(cmax)
+        out = torch.clamp(torch.nan_to_num(c, nan=lo, posinf=hi, neginf=lo), min=lo, max=hi)
+        tgt = float(target_mean)
+        for _ in range(max(1, int(n_iter))):
+            cur = float(self._mean_field(out).item())
+            delta = tgt - cur
+            if abs(delta) <= 1e-14:
+                break
+            out = torch.clamp(out + delta, min=lo, max=hi)
+        return out
 
     def _masked_mean_abs(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> float:
         """计算带掩膜的面积加权绝对值均值。"""
@@ -293,7 +325,16 @@ class CoupledSimulator:
 
     def _compute_mechanics_residual(self, mech_state: Dict[str, torch.Tensor], phi: torch.Tensor) -> float:
         """计算 `div(sigma)=0` 的离散残差均值（仅固相统计）。"""
-        bc = self._scalar_bc()
+        bx = str(getattr(self.cfg.mechanics, "mechanics_bc_x", "")).strip().lower()
+        by = str(getattr(self.cfg.mechanics, "mechanics_bc_y", "")).strip().lower()
+        if bx or by:
+            if not bx:
+                bx = str(getattr(self.cfg.mechanics, "mechanics_bc", "neumann")).strip().lower()
+            if not by:
+                by = str(getattr(self.cfg.mechanics, "mechanics_bc", "neumann")).strip().lower()
+            bc = {"x": bx, "y": by}
+        else:
+            bc = str(getattr(self.cfg.mechanics, "mechanics_bc", "neumann")).strip().lower()
         res_x = divergence(
             mech_state["sigma_xx"],
             mech_state["sigma_xy"],
@@ -1130,6 +1171,7 @@ class CoupledSimulator:
         self._last_gate_metrics["pde_eta"] = 0.0
         self._last_gate_metrics["pde_mech"] = 0.0
         self._last_gate_metrics["uncertainty"] = 0.0
+        self._last_gate_metrics["mass_delta"] = 0.0
 
         max_phi_drop = self.cfg.ml.max_mean_phi_drop
         if max_phi_drop > 0.0:
@@ -1153,6 +1195,16 @@ class CoupledSimulator:
         if c_abs_delta > 0.0:
             if abs(float(self._mean_field(nxt["c"] - prev["c"]).item())) > c_abs_delta:
                 return reject("c_mean_delta")
+        if bool(getattr(self.cfg.ml, "enable_mass_gate", False)):
+            m_prev = float(self._mean_field(prev["c"]).item())
+            m_nxt = float(self._mean_field(nxt["c"]).item())
+            m_abs = abs(m_nxt - m_prev)
+            self._last_gate_metrics["mass_delta"] = float(m_abs)
+            abs_tol = max(float(getattr(self.cfg.ml, "mass_abs_delta_max", 0.0)), 0.0)
+            rel_tol = max(float(getattr(self.cfg.ml, "mass_rel_delta_max", 0.0)), 0.0)
+            allow = abs_tol + rel_tol * max(abs(m_prev), 1e-12)
+            if m_abs > allow:
+                return reject("mass")
         eps_abs_delta = self.cfg.ml.max_mean_epspeq_abs_delta
         if eps_abs_delta > 0.0:
             if abs(float(self._mean_field(nxt["epspeq"] - prev["epspeq"]).item())) > eps_abs_delta:
@@ -1499,6 +1551,14 @@ class CoupledSimulator:
                 neginf=self.cfg.corrosion.cMg_min,
             )
         c_new = torch.clamp(c_tmp, min=self.cfg.corrosion.cMg_min, max=self.cfg.corrosion.cMg_max)
+        if bool(getattr(self.cfg.numerics, "concentration_mass_projection", False)):
+            c_ref = float(self._mean_field(cbar).item())
+            c_new = self._project_concentration_mean(
+                c_new,
+                c_ref,
+                n_iter=int(getattr(self.cfg.numerics, "concentration_mass_projection_iters", 2)),
+            )
+            self.stats["mass_projection_applied"] += 1
 
         # 孪晶 TDGL 方程推进。
         heta = smooth_heaviside(eta)
@@ -1571,6 +1631,7 @@ class CoupledSimulator:
         self._last_gate_metrics["pde_eta"] = 0.0
         self._last_gate_metrics["pde_mech"] = 0.0
         self._last_gate_metrics["uncertainty"] = 0.0
+        self._last_gate_metrics["mass_delta"] = 0.0
 
         ctx = torch.inference_mode if self.cfg.numerics.inference_mode else nullcontext
         if self.device.type == "cuda":
@@ -1609,6 +1670,14 @@ class CoupledSimulator:
                             )
                         if self._surrogate_update_is_valid(self.state, pred, candidate_mech=gate_mech):
                             self.stats["ml_surrogate_accept"] += 1
+                            if bool(getattr(self.cfg.ml, "enforce_mass_projection_on_accept", False)):
+                                c_ref = float(self._mean_field(self.state["c"]).item())
+                                pred["c"] = self._project_concentration_mean(
+                                    pred["c"],
+                                    c_ref,
+                                    n_iter=int(getattr(self.cfg.numerics, "concentration_mass_projection_iters", 2)),
+                                )
+                                self.stats["mass_projection_applied"] += 1
                             self.state = pred
                             self.epsp = self._epsp_from_state(self.state)
                             self._sync_epsp_to_state()

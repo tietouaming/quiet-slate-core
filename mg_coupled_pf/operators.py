@@ -12,22 +12,94 @@
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 
 
-def _pad_with_bc(x: torch.Tensor, bc: str = "neumann", dirichlet_value: float = 0.0) -> torch.Tensor:
-    """按边界条件填充 ghost 区域。"""
-    b = str(bc).strip().lower()
-    if b in {"neumann", "zero_flux", "zero-gradient", "zero_gradient"}:
-        # reflect 对中心差分等价于零法向梯度 ghost cell。
-        if x.shape[-2] < 2 or x.shape[-1] < 2:
-            return F.pad(x, (1, 1, 1, 1), mode="replicate")
-        return F.pad(x, (1, 1, 1, 1), mode="reflect")
-    if b in {"periodic", "circular"}:
-        return F.pad(x, (1, 1, 1, 1), mode="circular")
-    if b in {"dirichlet0", "dirichlet", "fixed0"}:
-        return F.pad(x, (1, 1, 1, 1), mode="constant", value=float(dirichlet_value))
-    raise ValueError(f"Unsupported boundary condition: {bc}")
+def _normalize_bc_name(name: str | None, fallback: str = "neumann") -> str:
+    """归一化边界条件名称。"""
+    if name is None:
+        name = fallback
+    b = str(name).strip().lower()
+    aliases = {
+        "zero_flux": "neumann",
+        "zero-gradient": "neumann",
+        "zero_gradient": "neumann",
+        "circular": "periodic",
+        "fixed0": "dirichlet0",
+        "dirichlet": "dirichlet0",
+    }
+    return aliases.get(b, b)
+
+
+def _split_bc(bc: str | tuple[str, str] | list[str] | dict[str, str] = "neumann") -> tuple[str, str]:
+    """将边界配置拆分为 `(bc_x, bc_y)`。"""
+    if isinstance(bc, dict):
+        bx = _normalize_bc_name(bc.get("x", bc.get("bx", "neumann")))
+        by = _normalize_bc_name(bc.get("y", bc.get("by", "neumann")))
+        return bx, by
+    if isinstance(bc, (tuple, list)):
+        if len(bc) != 2:
+            raise ValueError(f"Axis-wise bc expects length 2, got {len(bc)}.")
+        return _normalize_bc_name(bc[0]), _normalize_bc_name(bc[1])
+    b = str(bc).strip()
+    if "," in b:
+        parts = [p.strip() for p in b.split(",")]
+        if len(parts) != 2:
+            raise ValueError(f"Cannot parse axis-wise bc string: {bc}")
+        return _normalize_bc_name(parts[0]), _normalize_bc_name(parts[1])
+    bn = _normalize_bc_name(b)
+    return bn, bn
+
+
+def _pad_x(x: torch.Tensor, bc_x: str, dirichlet_value: float = 0.0) -> torch.Tensor:
+    """沿 x 方向添加 1 层 ghost cell。"""
+    b = _normalize_bc_name(bc_x)
+    if b == "neumann":
+        if x.shape[-1] < 2:
+            left = x[:, :, :, :1]
+            right = x[:, :, :, -1:]
+        else:
+            left = x[:, :, :, 1:2]
+            right = x[:, :, :, -2:-1]
+    elif b == "periodic":
+        left = x[:, :, :, -1:]
+        right = x[:, :, :, :1]
+    elif b == "dirichlet0":
+        left = torch.full_like(x[:, :, :, :1], float(dirichlet_value))
+        right = torch.full_like(x[:, :, :, :1], float(dirichlet_value))
+    else:
+        raise ValueError(f"Unsupported x boundary condition: {bc_x}")
+    return torch.cat([left, x, right], dim=3)
+
+
+def _pad_y(x: torch.Tensor, bc_y: str, dirichlet_value: float = 0.0) -> torch.Tensor:
+    """沿 y 方向添加 1 层 ghost cell。"""
+    b = _normalize_bc_name(bc_y)
+    if b == "neumann":
+        if x.shape[-2] < 2:
+            bottom = x[:, :, :1, :]
+            top = x[:, :, -1:, :]
+        else:
+            bottom = x[:, :, 1:2, :]
+            top = x[:, :, -2:-1, :]
+    elif b == "periodic":
+        bottom = x[:, :, -1:, :]
+        top = x[:, :, :1, :]
+    elif b == "dirichlet0":
+        bottom = torch.full_like(x[:, :, :1, :], float(dirichlet_value))
+        top = torch.full_like(x[:, :, :1, :], float(dirichlet_value))
+    else:
+        raise ValueError(f"Unsupported y boundary condition: {bc_y}")
+    return torch.cat([bottom, x, top], dim=2)
+
+
+def _pad_with_bc(
+    x: torch.Tensor,
+    bc: str | tuple[str, str] | list[str] | dict[str, str] = "neumann",
+    dirichlet_value: float = 0.0,
+) -> torch.Tensor:
+    """按边界条件填充 ghost 区域（可按轴分别指定）。"""
+    bx, by = _split_bc(bc)
+    return _pad_x(_pad_y(x, by, dirichlet_value), bx, dirichlet_value)
 
 
 def _deriv_x(
@@ -35,13 +107,14 @@ def _deriv_x(
     dx: float,
     x_coords: torch.Tensor | None = None,
     *,
-    bc: str = "neumann",
+    bc: str | tuple[str, str] | list[str] | dict[str, str] = "neumann",
     dirichlet_value: float = 0.0,
 ) -> torch.Tensor:
     """计算 x 方向一阶导数；可选非均匀坐标。"""
+    bx, by = _split_bc(bc)
     if x_coords is None:
         # 均匀网格：标准中心差分。
-        xp = _pad_with_bc(x, bc=bc, dirichlet_value=dirichlet_value)
+        xp = _pad_with_bc(x, bc=(bx, by), dirichlet_value=dirichlet_value)
         return (xp[:, :, 1:-1, 2:] - xp[:, :, 1:-1, :-2]) / (2.0 * dx)
 
     # 非均匀网格：三点二阶格式（内点）+ 一侧二阶格式（边界）。
@@ -80,7 +153,7 @@ def _deriv_x(
     cm1 = (2.0 * h2n + h1n) / (h2n * (h1n + h2n))
     out[:, :, :, -1] = cm3 * x[:, :, :, -3] + cm2 * x[:, :, :, -2] + cm1 * x[:, :, :, -1]
     # 非均匀网格边界若采用零通量，直接将边界法向梯度设为 0，避免伪通量泄漏。
-    if str(bc).strip().lower() in {"neumann", "zero_flux", "zero-gradient", "zero_gradient"}:
+    if bx == "neumann":
         out[:, :, :, 0] = 0.0
         out[:, :, :, -1] = 0.0
     return out
@@ -91,13 +164,14 @@ def _deriv_y(
     dy: float,
     y_coords: torch.Tensor | None = None,
     *,
-    bc: str = "neumann",
+    bc: str | tuple[str, str] | list[str] | dict[str, str] = "neumann",
     dirichlet_value: float = 0.0,
 ) -> torch.Tensor:
     """计算 y 方向一阶导数；可选非均匀坐标。"""
+    bx, by = _split_bc(bc)
     if y_coords is None:
         # 均匀网格：标准中心差分。
-        xp = _pad_with_bc(x, bc=bc, dirichlet_value=dirichlet_value)
+        xp = _pad_with_bc(x, bc=(bx, by), dirichlet_value=dirichlet_value)
         return (xp[:, :, 2:, 1:-1] - xp[:, :, :-2, 1:-1]) / (2.0 * dy)
 
     # 非均匀网格：三点二阶格式（内点）+ 一侧二阶格式（边界）。
@@ -135,7 +209,7 @@ def _deriv_y(
     cm2 = -(h1n + h2n) / (h1n * h2n)
     cm1 = (2.0 * h2n + h1n) / (h2n * (h1n + h2n))
     out[:, :, -1, :] = cm3 * x[:, :, -3, :] + cm2 * x[:, :, -2, :] + cm1 * x[:, :, -1, :]
-    if str(bc).strip().lower() in {"neumann", "zero_flux", "zero-gradient", "zero_gradient"}:
+    if by == "neumann":
         out[:, :, 0, :] = 0.0
         out[:, :, -1, :] = 0.0
     return out
@@ -146,7 +220,7 @@ def _second_deriv_x(
     dx: float,
     x_coords: torch.Tensor | None = None,
     *,
-    bc: str = "neumann",
+    bc: str | tuple[str, str] | list[str] | dict[str, str] = "neumann",
     dirichlet_value: float = 0.0,
 ) -> torch.Tensor:
     """计算 x 方向二阶导数；非均匀网格采用三点二阶公式。"""
@@ -177,7 +251,7 @@ def _second_deriv_y(
     dy: float,
     y_coords: torch.Tensor | None = None,
     *,
-    bc: str = "neumann",
+    bc: str | tuple[str, str] | list[str] | dict[str, str] = "neumann",
     dirichlet_value: float = 0.0,
 ) -> torch.Tensor:
     """计算 y 方向二阶导数；非均匀网格采用三点二阶公式。"""
@@ -209,7 +283,7 @@ def grad_xy(
     *,
     x_coords: torch.Tensor | None = None,
     y_coords: torch.Tensor | None = None,
-    bc: str = "neumann",
+    bc: str | tuple[str, str] | list[str] | dict[str, str] = "neumann",
     dirichlet_value: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """返回二维梯度 `(∂x, ∂y)`。"""
@@ -227,7 +301,7 @@ def divergence(
     *,
     x_coords: torch.Tensor | None = None,
     y_coords: torch.Tensor | None = None,
-    bc: str = "neumann",
+    bc: str | tuple[str, str] | list[str] | dict[str, str] = "neumann",
     dirichlet_value: float = 0.0,
 ) -> torch.Tensor:
     """返回散度 `∂x(gx) + ∂y(gy)`。"""
@@ -243,7 +317,7 @@ def laplacian(
     *,
     x_coords: torch.Tensor | None = None,
     y_coords: torch.Tensor | None = None,
-    bc: str = "neumann",
+    bc: str | tuple[str, str] | list[str] | dict[str, str] = "neumann",
     dirichlet_value: float = 0.0,
 ) -> torch.Tensor:
     """返回拉普拉斯 `∇²x`。"""

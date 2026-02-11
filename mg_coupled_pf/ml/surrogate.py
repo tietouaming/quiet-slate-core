@@ -65,6 +65,14 @@ def arch_requires_full_precision(model_arch: str) -> bool:
     return _normalize_arch(model_arch) in {"fno2d", "afno2d"}
 
 
+def _coord_channels_like(x: torch.Tensor) -> torch.Tensor:
+    """构造与输入同批量/分辨率的归一化坐标通道 `[x/L, y/L]`。"""
+    b, _, h, w = x.shape
+    yy = torch.linspace(-1.0, 1.0, h, device=x.device, dtype=x.dtype).view(1, 1, h, 1).expand(b, 1, h, w)
+    xx = torch.linspace(-1.0, 1.0, w, device=x.device, dtype=x.dtype).view(1, 1, 1, w).expand(b, 1, h, w)
+    return torch.cat([xx, yy], dim=1)
+
+
 class ConvBlock(nn.Module):
     """基础卷积块。"""
     def __init__(self, c_in: int, c_out: int):
@@ -82,16 +90,21 @@ class ConvBlock(nn.Module):
 
 class TinyUNet(nn.Module):
     """轻量 U-Net。"""
-    def __init__(self, in_ch: int, hidden: int = 32):
+    def __init__(self, in_ch: int, hidden: int = 32, out_ch: int | None = None, add_coords: bool = True):
         super().__init__()
-        self.enc1 = ConvBlock(in_ch, hidden)
+        self.add_coords = bool(add_coords)
+        in_proj_ch = int(in_ch + (2 if self.add_coords else 0))
+        o = int(in_ch if out_ch is None else out_ch)
+        self.enc1 = ConvBlock(in_proj_ch, hidden)
         self.down = nn.Conv2d(hidden, hidden * 2, 3, stride=2, padding=1)
         self.enc2 = ConvBlock(hidden * 2, hidden * 2)
         self.up = nn.ConvTranspose2d(hidden * 2, hidden, 4, stride=2, padding=1)
         self.dec = ConvBlock(hidden * 2, hidden)
-        self.out = nn.Conv2d(hidden, in_ch, 1)
+        self.out = nn.Conv2d(hidden, o, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.add_coords:
+            x = torch.cat([x, _coord_channels_like(x)], dim=1)
         e1 = self.enc1(x)
         e2 = self.enc2(self.down(e1))
         u = self.up(e2)
@@ -121,20 +134,32 @@ class DWConvBlock(nn.Module):
 
 class DWUNet(nn.Module):
     """深度可分离卷积版 U-Net。"""
-    def __init__(self, in_ch: int, hidden: int = 24, depth: int = 2):
+    def __init__(
+        self,
+        in_ch: int,
+        hidden: int = 24,
+        depth: int = 2,
+        out_ch: int | None = None,
+        add_coords: bool = True,
+    ):
         super().__init__()
+        self.add_coords = bool(add_coords)
+        in_proj_ch = int(in_ch + (2 if self.add_coords else 0))
+        o = int(in_ch if out_ch is None else out_ch)
         h = max(8, int(hidden))
         d = max(1, int(depth))
-        self.stem = nn.Conv2d(in_ch, h, 3, padding=1)
+        self.stem = nn.Conv2d(in_proj_ch, h, 3, padding=1)
         self.enc = nn.ModuleList([DWConvBlock(h, h) for _ in range(d)])
         self.down = nn.Conv2d(h, h * 2, 3, stride=2, padding=1)
         self.mid = nn.ModuleList([DWConvBlock(h * 2, h * 2) for _ in range(d + 1)])
         self.up = nn.ConvTranspose2d(h * 2, h, 4, stride=2, padding=1)
         self.dec_in = DWConvBlock(h * 2, h)
         self.dec = nn.ModuleList([DWConvBlock(h, h) for _ in range(max(0, d - 1))])
-        self.out = nn.Conv2d(h, in_ch, 1)
+        self.out = nn.Conv2d(h, o, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.add_coords:
+            x = torch.cat([x, _coord_channels_like(x)], dim=1)
         x0 = F.gelu(self.stem(x))
         x1 = x0
         for blk in self.enc:
@@ -201,9 +226,10 @@ class FNOBlock(nn.Module):
 
 class FNO2D(nn.Module):
     """二维 Fourier Neural Operator。"""
-    def __init__(self, in_ch: int, width: int = 32, modes_x: int = 24, modes_y: int = 16, depth: int = 4):
+    def __init__(self, in_ch: int, width: int = 32, modes_x: int = 24, modes_y: int = 16, depth: int = 4, out_ch: int | None = None):
         super().__init__()
         self.in_ch = int(in_ch)
+        self.out_ch = int(self.in_ch if out_ch is None else out_ch)
         self.width = max(8, int(width))
         self.modes_x = max(2, int(modes_x))
         self.modes_y = max(2, int(modes_y))
@@ -211,7 +237,7 @@ class FNO2D(nn.Module):
         self.in_proj = nn.Conv2d(self.in_ch + 2, self.width, 1)
         self.blocks = nn.ModuleList([FNOBlock(self.width, self.modes_x, self.modes_y) for _ in range(self.depth)])
         self.mid_proj = nn.Conv2d(self.width, self.width, 1)
-        self.out_proj = nn.Conv2d(self.width, self.in_ch, 1)
+        self.out_proj = nn.Conv2d(self.width, self.out_ch, 1)
 
     def _coord_grid(self, x: torch.Tensor) -> torch.Tensor:
         b, _, h, w = x.shape
@@ -281,9 +307,11 @@ class AFNO2D(nn.Module):
         modes_y: int = 12,
         depth: int = 4,
         expansion: float = 2.0,
+        out_ch: int | None = None,
     ):
         super().__init__()
         self.in_ch = int(in_ch)
+        self.out_ch = int(self.in_ch if out_ch is None else out_ch)
         self.width = max(8, int(width))
         self.modes_x = max(2, int(modes_x))
         self.modes_y = max(2, int(modes_y))
@@ -296,7 +324,7 @@ class AFNO2D(nn.Module):
         self.out_proj = nn.Sequential(
             nn.Conv2d(self.width, self.width, 1),
             nn.GELU(),
-            nn.Conv2d(self.width, self.in_ch, 1),
+            nn.Conv2d(self.width, self.out_ch, 1),
         )
 
     def _coord_grid(self, x: torch.Tensor) -> torch.Tensor:
@@ -321,7 +349,29 @@ class SurrogatePredictor:
     residual_gate: float = 2.5
     channels_last: bool = False
     model_arch: str = "tiny_unet"
+    add_coord_features: bool = True
+    enforce_displacement_constraints: bool = False
+    loading_mode: str = "eigenstrain"
+    dirichlet_right_ux: float = 0.0
+    enforce_uy_anchor: bool = True
     arch_kwargs: Dict[str, Any] = field(default_factory=dict)
+
+    @staticmethod
+    def _use_dirichlet_x(loading_mode: str) -> bool:
+        """判断当前加载模式是否需要右端位移 Dirichlet 约束。"""
+        m = str(loading_mode).strip().lower()
+        return m in {"dirichlet_x", "dirichlet", "ux_dirichlet"}
+
+    def _project_mechanics_constraints(self, nxt: Dict[str, torch.Tensor]) -> None:
+        """将 surrogate 输出硬投影到位移约束空间。"""
+        if not self.enforce_displacement_constraints:
+            return
+        if "ux" in nxt:
+            nxt["ux"][:, :, :, 0] = 0.0
+            if self._use_dirichlet_x(self.loading_mode):
+                nxt["ux"][:, :, :, -1] = float(self.dirichlet_right_ux)
+        if self.enforce_uy_anchor and "uy" in nxt:
+            nxt["uy"][:, :, 0, 0] = 0.0
 
     def predict(self, state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         self.model.eval()
@@ -330,19 +380,21 @@ class SurrogatePredictor:
         else:
             amp_ctx = nullcontext()
         with torch.inference_mode(), amp_ctx:
-            x = state_to_tensor(state)
+            x_base = state_to_tensor(state)
+            x = x_base
             if self.model_arch in {"fno2d", "afno2d"}:
                 x = x.float()
             if self.channels_last:
                 x = x.contiguous(memory_format=torch.channels_last)
             dx = self.model(x)
-            x1 = x + dx
+            x1 = x_base + dx.to(dtype=x_base.dtype)
         nxt = tensor_to_state(x1)
         nxt["phi"] = torch.clamp(nxt["phi"], 0.0, 1.0)
         nxt["c"] = torch.clamp(nxt["c"], 0.0, 1.0)
         nxt["eta"] = torch.clamp(nxt["eta"], 0.0, 1.0)
         nxt["ux"] = torch.nan_to_num(nxt["ux"], nan=0.0, posinf=0.0, neginf=0.0)
         nxt["uy"] = torch.nan_to_num(nxt["uy"], nan=0.0, posinf=0.0, neginf=0.0)
+        self._project_mechanics_constraints(nxt)
         nxt["epspeq"] = torch.clamp(nxt["epspeq"], 0.0, 1e6)
         nxt["epsp_xx"] = torch.clamp(torch.nan_to_num(nxt["epsp_xx"], nan=0.0, posinf=0.0, neginf=0.0), min=-1.0, max=1.0)
         nxt["epsp_yy"] = torch.clamp(torch.nan_to_num(nxt["epsp_yy"], nan=0.0, posinf=0.0, neginf=0.0), min=-1.0, max=1.0)
@@ -382,7 +434,9 @@ def _maybe_compile(model: nn.Module, enabled: bool) -> nn.Module:
 def _build_model(
     model_arch: str,
     in_ch: int,
+    out_ch: int,
     *,
+    add_coord_features: bool = True,
     hidden: int = 32,
     dw_hidden: int = 24,
     dw_depth: int = 2,
@@ -399,11 +453,34 @@ def _build_model(
     """按配置构建模型并返回(模型, 架构名, 架构参数)。"""
     arch = _normalize_arch(model_arch)
     if arch == "tiny_unet":
-        kwargs = {"hidden": int(hidden)}
-        return TinyUNet(in_ch=in_ch, hidden=kwargs["hidden"]), arch, kwargs
+        kwargs = {"hidden": int(hidden), "add_coord_features": bool(add_coord_features)}
+        return (
+            TinyUNet(
+                in_ch=in_ch,
+                hidden=kwargs["hidden"],
+                out_ch=out_ch,
+                add_coords=kwargs["add_coord_features"],
+            ),
+            arch,
+            kwargs,
+        )
     if arch == "dw_unet":
-        kwargs = {"dw_hidden": int(dw_hidden), "dw_depth": int(dw_depth)}
-        return DWUNet(in_ch=in_ch, hidden=kwargs["dw_hidden"], depth=kwargs["dw_depth"]), arch, kwargs
+        kwargs = {
+            "dw_hidden": int(dw_hidden),
+            "dw_depth": int(dw_depth),
+            "add_coord_features": bool(add_coord_features),
+        }
+        return (
+            DWUNet(
+                in_ch=in_ch,
+                hidden=kwargs["dw_hidden"],
+                depth=kwargs["dw_depth"],
+                out_ch=out_ch,
+                add_coords=kwargs["add_coord_features"],
+            ),
+            arch,
+            kwargs,
+        )
     if arch == "afno2d":
         kwargs = {
             "afno_width": int(afno_width),
@@ -420,6 +497,7 @@ def _build_model(
                 modes_y=kwargs["afno_modes_y"],
                 depth=kwargs["afno_depth"],
                 expansion=kwargs["afno_expansion"],
+                out_ch=out_ch,
             ),
             arch,
             kwargs,
@@ -437,6 +515,7 @@ def _build_model(
             modes_x=kwargs["fno_modes_x"],
             modes_y=kwargs["fno_modes_y"],
             depth=kwargs["fno_depth"],
+            out_ch=out_ch,
         ),
         arch,
         kwargs,
@@ -448,6 +527,7 @@ def build_surrogate(
     use_torch_compile: bool = False,
     channels_last: bool = False,
     model_arch: str = "tiny_unet",
+    add_coord_features: bool = True,
     hidden: int = 32,
     dw_hidden: int = 24,
     dw_depth: int = 2,
@@ -465,6 +545,8 @@ def build_surrogate(
     model, arch, arch_kwargs = _build_model(
         model_arch=model_arch,
         in_ch=len(FIELD_ORDER),
+        out_ch=len(FIELD_ORDER),
+        add_coord_features=add_coord_features,
         hidden=hidden,
         dw_hidden=dw_hidden,
         dw_depth=dw_depth,
@@ -487,6 +569,7 @@ def build_surrogate(
         device=device,
         channels_last=channels_last and device.type == "cuda",
         model_arch=arch,
+        add_coord_features=bool(add_coord_features),
         arch_kwargs=arch_kwargs,
     )
 
@@ -501,6 +584,7 @@ def save_surrogate(predictor: SurrogatePredictor, path: str | Path) -> None:
             "meta": {
                 "model_arch": predictor.model_arch,
                 "arch_kwargs": predictor.arch_kwargs,
+                "add_coord_features": bool(predictor.add_coord_features),
                 "field_order": FIELD_ORDER,
             },
         },
@@ -532,11 +616,13 @@ def load_surrogate(
         arch_kwargs.update(meta_kwargs)
 
     arch = _normalize_arch(str(meta.get("model_arch", fallback_model_arch)))
+    add_coord_features = bool(meta.get("add_coord_features", arch_kwargs.get("add_coord_features", True)))
     predictor = build_surrogate(
         device=device,
         use_torch_compile=False,
         channels_last=device.type == "cuda",
         model_arch=arch,
+        add_coord_features=add_coord_features,
         hidden=int(arch_kwargs.get("hidden", 32)),
         dw_hidden=int(arch_kwargs.get("dw_hidden", 24)),
         dw_depth=int(arch_kwargs.get("dw_depth", 2)),
@@ -561,5 +647,6 @@ def load_surrogate(
     predictor.model.eval()
     predictor.model = _maybe_compile(predictor.model, use_torch_compile)
     predictor.model_arch = arch
+    predictor.add_coord_features = bool(add_coord_features)
     predictor.arch_kwargs = dict(arch_kwargs)
     return predictor

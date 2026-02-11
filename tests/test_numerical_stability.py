@@ -267,6 +267,35 @@ def test_surrogate_gate_rejects_by_energy_increase() -> None:
     assert sim.stats["ml_reject_energy"] > 0
 
 
+def test_surrogate_gate_rejects_by_mass_delta() -> None:
+    """验证 surrogate 门控可由 cMg 全域质量变化触发拒绝。"""
+    cfg = load_config("configs/notch_case.yaml")
+    cfg.runtime.device = "cpu"
+    cfg.domain.nx = 40
+    cfg.domain.ny = 28
+    cfg.ml.enabled = False
+    cfg.ml.max_field_delta = 10.0
+    cfg.ml.max_mean_phi_drop = 10.0
+    cfg.ml.max_mean_eta_rise = 10.0
+    cfg.ml.max_mean_phi_abs_delta = 10.0
+    cfg.ml.max_mean_eta_abs_delta = 10.0
+    cfg.ml.max_mean_c_abs_delta = 10.0
+    cfg.ml.max_mean_epspeq_abs_delta = 10.0
+    cfg.ml.residual_gate = 10.0
+    cfg.ml.enable_pde_residual_gate = False
+    cfg.ml.enable_energy_gate = False
+    cfg.ml.enable_mass_gate = True
+    cfg.ml.mass_abs_delta_max = 1e-8
+    cfg.ml.mass_rel_delta_max = 0.0
+    sim = CoupledSimulator(cfg)
+    prev = {k: v.clone() for k, v in sim.state.items()}
+    nxt = {k: v.clone() for k, v in prev.items()}
+    nxt["c"] = torch.clamp(prev["c"] + 5e-3, 0.0, 1.0)
+    ok = sim._surrogate_update_is_valid(prev, nxt)
+    assert ok is False
+    assert sim.stats["ml_reject_mass"] > 0
+
+
 def test_mechanics_dirichlet_x_boundary_enforced() -> None:
     """验证位移边界加载模式下右边界位移被严格约束。"""
     cfg = load_config("configs/notch_case.yaml")
@@ -379,3 +408,18 @@ def test_scalar_linear_solver_auto_fallback_to_bicgstab() -> None:
     assert sim.stats["scalar_pcg_calls"] >= 1
     assert sim.stats["scalar_solver_fallback"] >= 1
     assert sim.stats["scalar_bicgstab_calls"] >= 1
+
+
+def test_concentration_mass_projection_applied_in_physics_step() -> None:
+    """开启质量投影后，物理步应记录投影应用计数。"""
+    cfg = load_config("configs/notch_case.yaml")
+    cfg.runtime.device = "cpu"
+    cfg.ml.enabled = False
+    cfg.domain.nx = 36
+    cfg.domain.ny = 24
+    cfg.numerics.n_steps = 1
+    cfg.numerics.concentration_mass_projection = True
+    cfg.numerics.concentration_mass_projection_iters = 2
+    sim = CoupledSimulator(cfg)
+    sim._physics_step(cfg.numerics.dt_s, 1)
+    assert sim.stats["mass_projection_applied"] >= 1

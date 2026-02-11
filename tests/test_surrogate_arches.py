@@ -57,3 +57,25 @@ def test_predict_compatible_with_legacy_state_without_epsp_tensor_channels() -> 
     for k in FIELD_ORDER:
         assert k in y
         assert y[k].shape == (1, 1, 16, 20)
+
+
+def test_predict_applies_mechanics_boundary_projection() -> None:
+    """验证 surrogate 可将位移输出硬投影回力学边界约束。"""
+    dev = torch.device("cpu")
+    p = build_surrogate(
+        device=dev,
+        use_torch_compile=False,
+        channels_last=False,
+        model_arch="tiny_unet",
+        hidden=12,
+        add_coord_features=True,
+    )
+    p.enforce_displacement_constraints = True
+    p.loading_mode = "dirichlet_x"
+    p.dirichlet_right_ux = 0.123
+    p.enforce_uy_anchor = True
+    x = _state(dev, h=18, w=22)
+    y = p.predict(x)
+    assert float(torch.max(torch.abs(y["ux"][:, :, :, 0])).item()) < 1e-8
+    assert float(torch.max(torch.abs(y["ux"][:, :, :, -1] - 0.123)).item()) < 1e-8
+    assert abs(float(y["uy"][0, 0, 0, 0].item())) < 1e-8

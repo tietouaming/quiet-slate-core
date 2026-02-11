@@ -74,3 +74,13 @@ def test_uniform_neumann_boundary_zero_normal_gradient() -> None:
     assert right < 1e-12
     assert bottom < 1e-12
     assert top < 1e-12
+
+
+def test_axis_wise_bc_tuple_and_dict_are_consistent() -> None:
+    """按轴边界条件的 tuple 与 dict 写法应等价。"""
+    torch.manual_seed(3)
+    u = torch.rand((1, 1, 25, 31), dtype=torch.float64)
+    gx1, gy1 = grad_xy(u, dx=1.0, dy=1.0, bc=("periodic", "neumann"))
+    gx2, gy2 = grad_xy(u, dx=1.0, dy=1.0, bc={"x": "periodic", "y": "neumann"})
+    assert torch.allclose(gx1, gx2, atol=1e-12, rtol=1e-12)
+    assert torch.allclose(gy1, gy2, atol=1e-12, rtol=1e-12)

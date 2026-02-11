@@ -458,6 +458,7 @@ def main() -> None:
         device=device,
         use_torch_compile=cfg.numerics.use_torch_compile and device.type == "cuda",
         model_arch=cfg.ml.model_arch,
+        add_coord_features=bool(getattr(cfg.ml, "surrogate_add_coord_features", True)),
         hidden=cfg.ml.model_hidden,
         dw_hidden=cfg.ml.dw_hidden,
         dw_depth=cfg.ml.dw_depth,
@@ -731,6 +732,7 @@ def main() -> None:
                 },
                 "rollout_steps": rollout_steps,
                 "model_kwargs": {
+                    "add_coord_features": bool(getattr(cfg.ml, "surrogate_add_coord_features", True)),
                     "hidden": int(cfg.ml.model_hidden),
                     "dw_hidden": int(cfg.ml.dw_hidden),
                     "dw_depth": int(cfg.ml.dw_depth),

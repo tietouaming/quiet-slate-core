@@ -47,6 +47,18 @@ class MechanicsModel:
         """返回规范化后的加载模式。"""
         return str(self.cfg.mechanics.loading_mode).strip().lower()
 
+    def _mech_bc(self) -> str | Dict[str, str]:
+        """返回力学离散边界条件（支持按轴独立设置）。"""
+        bx = str(getattr(self.cfg.mechanics, "mechanics_bc_x", "")).strip().lower()
+        by = str(getattr(self.cfg.mechanics, "mechanics_bc_y", "")).strip().lower()
+        if bx or by:
+            if not bx:
+                bx = str(getattr(self.cfg.mechanics, "mechanics_bc", "neumann")).strip().lower()
+            if not by:
+                by = str(getattr(self.cfg.mechanics, "mechanics_bc", "neumann")).strip().lower()
+            return {"x": bx, "y": by}
+        return str(getattr(self.cfg.mechanics, "mechanics_bc", "neumann")).strip().lower()
+
     def _use_dirichlet_x(self) -> bool:
         """是否采用 x 向位移边界加载。"""
         return self._loading_mode() in {"dirichlet_x", "dirichlet", "ux_dirichlet"}
@@ -123,8 +135,9 @@ class MechanicsModel:
         y_coords_um: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         """仅由位移梯度构造线性应变。"""
-        dux_dx, dux_dy = grad_xy(ux, dx_um, dy_um, x_coords=x_coords_um, y_coords=y_coords_um)
-        duy_dx, duy_dy = grad_xy(uy, dx_um, dy_um, x_coords=x_coords_um, y_coords=y_coords_um)
+        bc = self._mech_bc()
+        dux_dx, dux_dy = grad_xy(ux, dx_um, dy_um, x_coords=x_coords_um, y_coords=y_coords_um, bc=bc)
+        duy_dx, duy_dy = grad_xy(uy, dx_um, dy_um, x_coords=x_coords_um, y_coords=y_coords_um, bc=bc)
         ex = dux_dx
         ey = duy_dy
         exy = 0.5 * (dux_dy + duy_dx)
@@ -199,6 +212,7 @@ class MechanicsModel:
         y_coords_um: torch.Tensor | None = None,
     ):
         """构造矩阵自由线性算子 A(u)=b（固定 eta/epsp/phi 的单步问题）。"""
+        bc = self._mech_bc()
         eta = state["eta"]
         phi = state["phi"]
         eps_tw = self.twin_strain(eta)
@@ -207,8 +221,24 @@ class MechanicsModel:
         ey0 = -epsp["eyy"] - eps_tw["eyy"]
         exy0 = -epsp["exy"] - eps_tw["exy"]
         sig0 = self.constitutive_stress(phi, ex0, ey0, exy0)
-        b_x = -divergence(sig0["sigma_xx"], sig0["sigma_xy"], dx_um, dy_um, x_coords=x_coords_um, y_coords=y_coords_um)
-        b_y = -divergence(sig0["sigma_xy"], sig0["sigma_yy"], dx_um, dy_um, x_coords=x_coords_um, y_coords=y_coords_um)
+        b_x = -divergence(
+            sig0["sigma_xx"],
+            sig0["sigma_xy"],
+            dx_um,
+            dy_um,
+            x_coords=x_coords_um,
+            y_coords=y_coords_um,
+            bc=bc,
+        )
+        b_y = -divergence(
+            sig0["sigma_xy"],
+            sig0["sigma_yy"],
+            dx_um,
+            dy_um,
+            x_coords=x_coords_um,
+            y_coords=y_coords_um,
+            bc=bc,
+        )
         b_x = torch.nan_to_num(b_x, nan=0.0, posinf=0.0, neginf=0.0)
         b_y = torch.nan_to_num(b_y, nan=0.0, posinf=0.0, neginf=0.0)
         b_x, b_y = self._apply_vector_constraints(b_x, b_y)
@@ -223,8 +253,24 @@ class MechanicsModel:
                 y_coords_um=y_coords_um,
             )
             sig_u = self.constitutive_stress(phi, eps_u["eps_xx"], eps_u["eps_yy"], eps_u["eps_xy"])
-            ax = divergence(sig_u["sigma_xx"], sig_u["sigma_xy"], dx_um, dy_um, x_coords=x_coords_um, y_coords=y_coords_um)
-            ay = divergence(sig_u["sigma_xy"], sig_u["sigma_yy"], dx_um, dy_um, x_coords=x_coords_um, y_coords=y_coords_um)
+            ax = divergence(
+                sig_u["sigma_xx"],
+                sig_u["sigma_xy"],
+                dx_um,
+                dy_um,
+                x_coords=x_coords_um,
+                y_coords=y_coords_um,
+                bc=bc,
+            )
+            ay = divergence(
+                sig_u["sigma_xy"],
+                sig_u["sigma_yy"],
+                dx_um,
+                dy_um,
+                x_coords=x_coords_um,
+                y_coords=y_coords_um,
+                bc=bc,
+            )
             ax = torch.nan_to_num(ax, nan=0.0, posinf=0.0, neginf=0.0)
             ay = torch.nan_to_num(ay, nan=0.0, posinf=0.0, neginf=0.0)
             ax, ay = self._apply_vector_constraints(ax, ay)
@@ -503,6 +549,7 @@ class MechanicsModel:
         uy0: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """阻尼残差松弛（旧求解器，作为稳健回退）。"""
+        bc = self._mech_bc()
         ux = state["ux"] if ux0 is None else ux0
         uy = state["uy"] if uy0 is None else uy0
         eta = state["eta"]
@@ -537,8 +584,24 @@ class MechanicsModel:
                 y_coords_um=y_coords_um,
             )
             sig = self.constitutive_stress(phi, eps["eps_xx"], eps["eps_yy"], eps["eps_xy"])
-            div_x = divergence(sig["sigma_xx"], sig["sigma_xy"], dx_um, dy_um, x_coords=x_coords_um, y_coords=y_coords_um)
-            div_y = divergence(sig["sigma_xy"], sig["sigma_yy"], dx_um, dy_um, x_coords=x_coords_um, y_coords=y_coords_um)
+            div_x = divergence(
+                sig["sigma_xx"],
+                sig["sigma_xy"],
+                dx_um,
+                dy_um,
+                x_coords=x_coords_um,
+                y_coords=y_coords_um,
+                bc=bc,
+            )
+            div_y = divergence(
+                sig["sigma_xy"],
+                sig["sigma_yy"],
+                dx_um,
+                dy_um,
+                x_coords=x_coords_um,
+                y_coords=y_coords_um,
+                bc=bc,
+            )
             div_x = torch.nan_to_num(div_x, nan=0.0, posinf=0.0, neginf=0.0)
             div_y = torch.nan_to_num(div_y, nan=0.0, posinf=0.0, neginf=0.0)
             div_x = torch.clamp(div_x, min=-5e4, max=5e4)
