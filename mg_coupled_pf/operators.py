@@ -50,7 +50,34 @@ def _split_bc(bc: str | tuple[str, str] | list[str] | dict[str, str] = "neumann"
     return bn, bn
 
 
-def _pad_x(x: torch.Tensor, bc_x: str, dirichlet_value: float = 0.0) -> torch.Tensor:
+def _split_dirichlet_value(
+    dirichlet_value: float | tuple[float, float] | list[float] | dict[str, float] | None,
+    axis: str,
+) -> tuple[float, float]:
+    """解析按轴/按侧 Dirichlet 值。"""
+    if dirichlet_value is None:
+        return 0.0, 0.0
+    if isinstance(dirichlet_value, dict):
+        if axis == "x":
+            left = dirichlet_value.get("x_left", dirichlet_value.get("left", dirichlet_value.get("xmin", 0.0)))
+            right = dirichlet_value.get("x_right", dirichlet_value.get("right", dirichlet_value.get("xmax", left)))
+            return float(left), float(right)
+        bottom = dirichlet_value.get("y_bottom", dirichlet_value.get("bottom", dirichlet_value.get("ymin", 0.0)))
+        top = dirichlet_value.get("y_top", dirichlet_value.get("top", dirichlet_value.get("ymax", bottom)))
+        return float(bottom), float(top)
+    if isinstance(dirichlet_value, (tuple, list)):
+        if len(dirichlet_value) != 2:
+            raise ValueError(f"dirichlet_value sequence expects length 2, got {len(dirichlet_value)}")
+        return float(dirichlet_value[0]), float(dirichlet_value[1])
+    v = float(dirichlet_value)
+    return v, v
+
+
+def _pad_x(
+    x: torch.Tensor,
+    bc_x: str,
+    dirichlet_value: float | tuple[float, float] | list[float] | dict[str, float] | None = 0.0,
+) -> torch.Tensor:
     """沿 x 方向添加 1 层 ghost cell。"""
     b = _normalize_bc_name(bc_x)
     if b == "neumann":
@@ -64,14 +91,19 @@ def _pad_x(x: torch.Tensor, bc_x: str, dirichlet_value: float = 0.0) -> torch.Te
         left = x[:, :, :, -1:]
         right = x[:, :, :, :1]
     elif b == "dirichlet0":
-        left = torch.full_like(x[:, :, :, :1], float(dirichlet_value))
-        right = torch.full_like(x[:, :, :, :1], float(dirichlet_value))
+        left_v, right_v = _split_dirichlet_value(dirichlet_value, axis="x")
+        left = torch.full_like(x[:, :, :, :1], float(left_v))
+        right = torch.full_like(x[:, :, :, :1], float(right_v))
     else:
         raise ValueError(f"Unsupported x boundary condition: {bc_x}")
     return torch.cat([left, x, right], dim=3)
 
 
-def _pad_y(x: torch.Tensor, bc_y: str, dirichlet_value: float = 0.0) -> torch.Tensor:
+def _pad_y(
+    x: torch.Tensor,
+    bc_y: str,
+    dirichlet_value: float | tuple[float, float] | list[float] | dict[str, float] | None = 0.0,
+) -> torch.Tensor:
     """沿 y 方向添加 1 层 ghost cell。"""
     b = _normalize_bc_name(bc_y)
     if b == "neumann":
@@ -85,8 +117,9 @@ def _pad_y(x: torch.Tensor, bc_y: str, dirichlet_value: float = 0.0) -> torch.Te
         bottom = x[:, :, -1:, :]
         top = x[:, :, :1, :]
     elif b == "dirichlet0":
-        bottom = torch.full_like(x[:, :, :1, :], float(dirichlet_value))
-        top = torch.full_like(x[:, :, :1, :], float(dirichlet_value))
+        bottom_v, top_v = _split_dirichlet_value(dirichlet_value, axis="y")
+        bottom = torch.full_like(x[:, :, :1, :], float(bottom_v))
+        top = torch.full_like(x[:, :, :1, :], float(top_v))
     else:
         raise ValueError(f"Unsupported y boundary condition: {bc_y}")
     return torch.cat([bottom, x, top], dim=2)
@@ -95,7 +128,7 @@ def _pad_y(x: torch.Tensor, bc_y: str, dirichlet_value: float = 0.0) -> torch.Te
 def _pad_with_bc(
     x: torch.Tensor,
     bc: str | tuple[str, str] | list[str] | dict[str, str] = "neumann",
-    dirichlet_value: float = 0.0,
+    dirichlet_value: float | tuple[float, float] | list[float] | dict[str, float] | None = 0.0,
 ) -> torch.Tensor:
     """按边界条件填充 ghost 区域（可按轴分别指定）。"""
     bx, by = _split_bc(bc)
@@ -108,7 +141,7 @@ def _deriv_x(
     x_coords: torch.Tensor | None = None,
     *,
     bc: str | tuple[str, str] | list[str] | dict[str, str] = "neumann",
-    dirichlet_value: float = 0.0,
+    dirichlet_value: float | tuple[float, float] | list[float] | dict[str, float] | None = 0.0,
 ) -> torch.Tensor:
     """计算 x 方向一阶导数；可选非均匀坐标。"""
     bx, by = _split_bc(bc)
@@ -165,7 +198,7 @@ def _deriv_y(
     y_coords: torch.Tensor | None = None,
     *,
     bc: str | tuple[str, str] | list[str] | dict[str, str] = "neumann",
-    dirichlet_value: float = 0.0,
+    dirichlet_value: float | tuple[float, float] | list[float] | dict[str, float] | None = 0.0,
 ) -> torch.Tensor:
     """计算 y 方向一阶导数；可选非均匀坐标。"""
     bx, by = _split_bc(bc)
@@ -221,7 +254,7 @@ def _second_deriv_x(
     x_coords: torch.Tensor | None = None,
     *,
     bc: str | tuple[str, str] | list[str] | dict[str, str] = "neumann",
-    dirichlet_value: float = 0.0,
+    dirichlet_value: float | tuple[float, float] | list[float] | dict[str, float] | None = 0.0,
 ) -> torch.Tensor:
     """计算 x 方向二阶导数；非均匀网格采用三点二阶公式。"""
     if x_coords is None:
@@ -252,7 +285,7 @@ def _second_deriv_y(
     y_coords: torch.Tensor | None = None,
     *,
     bc: str | tuple[str, str] | list[str] | dict[str, str] = "neumann",
-    dirichlet_value: float = 0.0,
+    dirichlet_value: float | tuple[float, float] | list[float] | dict[str, float] | None = 0.0,
 ) -> torch.Tensor:
     """计算 y 方向二阶导数；非均匀网格采用三点二阶公式。"""
     if y_coords is None:
@@ -284,7 +317,7 @@ def grad_xy(
     x_coords: torch.Tensor | None = None,
     y_coords: torch.Tensor | None = None,
     bc: str | tuple[str, str] | list[str] | dict[str, str] = "neumann",
-    dirichlet_value: float = 0.0,
+    dirichlet_value: float | tuple[float, float] | list[float] | dict[str, float] | None = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """返回二维梯度 `(∂x, ∂y)`。"""
     return (
@@ -302,7 +335,7 @@ def divergence(
     x_coords: torch.Tensor | None = None,
     y_coords: torch.Tensor | None = None,
     bc: str | tuple[str, str] | list[str] | dict[str, str] = "neumann",
-    dirichlet_value: float = 0.0,
+    dirichlet_value: float | tuple[float, float] | list[float] | dict[str, float] | None = 0.0,
 ) -> torch.Tensor:
     """返回散度 `∂x(gx) + ∂y(gy)`。"""
     return _deriv_x(gx, dx, x_coords, bc=bc, dirichlet_value=dirichlet_value) + _deriv_y(
@@ -318,7 +351,7 @@ def laplacian(
     x_coords: torch.Tensor | None = None,
     y_coords: torch.Tensor | None = None,
     bc: str | tuple[str, str] | list[str] | dict[str, str] = "neumann",
-    dirichlet_value: float = 0.0,
+    dirichlet_value: float | tuple[float, float] | list[float] | dict[str, float] | None = 0.0,
 ) -> torch.Tensor:
     """返回拉普拉斯 `∇²x`。"""
     dxx = _second_deriv_x(x, dx, x_coords=x_coords, bc=bc, dirichlet_value=dirichlet_value)
@@ -326,10 +359,10 @@ def laplacian(
     return dxx + dyy
 
 
-def smooth_heaviside(phi: torch.Tensor) -> torch.Tensor:
+def smooth_heaviside(phi: torch.Tensor, *, clamp_input: bool = True) -> torch.Tensor:
     """平滑 Heaviside 插值函数（五次多项式）。"""
     # 6p^5 - 15p^4 + 10p^3，保证 0/1 两端一阶导连续为 0。
-    p = torch.clamp(phi, 0.0, 1.0)
+    p = torch.clamp(phi, 0.0, 1.0) if clamp_input else phi
     return p * p * p * (10.0 - 15.0 * p + 6.0 * p * p)
 
 
@@ -338,20 +371,20 @@ def solid_indicator(phi: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
     return (phi >= threshold).to(dtype=phi.dtype)
 
 
-def smooth_heaviside_prime(phi: torch.Tensor) -> torch.Tensor:
+def smooth_heaviside_prime(phi: torch.Tensor, *, clamp_input: bool = True) -> torch.Tensor:
     """平滑 Heaviside 的导数。"""
     # 对五次插值函数求导后的显式表达式。
-    p = torch.clamp(phi, 0.0, 1.0)
+    p = torch.clamp(phi, 0.0, 1.0) if clamp_input else phi
     return 30.0 * p * p * (p - 1.0) * (p - 1.0)
 
 
-def double_well(phi: torch.Tensor) -> torch.Tensor:
+def double_well(phi: torch.Tensor, *, clamp_input: bool = True) -> torch.Tensor:
     """双稳势函数 `16*phi^2*(1-phi)^2`。"""
-    p = torch.clamp(phi, 0.0, 1.0)
+    p = torch.clamp(phi, 0.0, 1.0) if clamp_input else phi
     return 16.0 * p * p * (1.0 - p) * (1.0 - p)
 
 
-def double_well_prime(phi: torch.Tensor) -> torch.Tensor:
+def double_well_prime(phi: torch.Tensor, *, clamp_input: bool = True) -> torch.Tensor:
     """双稳势对 phi 的导数。"""
-    p = torch.clamp(phi, 0.0, 1.0)
+    p = torch.clamp(phi, 0.0, 1.0) if clamp_input else phi
     return 32.0 * p * (1.0 - p) * (1.0 - 2.0 * p)

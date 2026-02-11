@@ -73,6 +73,12 @@ def _coord_channels_like(x: torch.Tensor) -> torch.Tensor:
     return torch.cat([xx, yy], dim=1)
 
 
+def _soft_project_01(x: torch.Tensor, beta: float = 20.0) -> torch.Tensor:
+    """可微 [0,1] 软投影，区间内近似恒等、区间外平滑回推。"""
+    y = x - F.softplus(x - 1.0, beta=beta) / beta + F.softplus(-x, beta=beta) / beta
+    return y
+
+
 class ConvBlock(nn.Module):
     """基础卷积块。"""
     def __init__(self, c_in: int, c_out: int):
@@ -389,9 +395,9 @@ class SurrogatePredictor:
             dx = self.model(x)
             x1 = x_base + dx.to(dtype=x_base.dtype)
         nxt = tensor_to_state(x1)
-        nxt["phi"] = torch.clamp(nxt["phi"], 0.0, 1.0)
-        nxt["c"] = torch.clamp(nxt["c"], 0.0, 1.0)
-        nxt["eta"] = torch.clamp(nxt["eta"], 0.0, 1.0)
+        nxt["phi"] = _soft_project_01(torch.nan_to_num(nxt["phi"], nan=0.5, posinf=1.0, neginf=0.0))
+        nxt["c"] = _soft_project_01(torch.nan_to_num(nxt["c"], nan=0.5, posinf=1.0, neginf=0.0))
+        nxt["eta"] = _soft_project_01(torch.nan_to_num(nxt["eta"], nan=0.0, posinf=1.0, neginf=0.0))
         nxt["ux"] = torch.nan_to_num(nxt["ux"], nan=0.0, posinf=0.0, neginf=0.0)
         nxt["uy"] = torch.nan_to_num(nxt["uy"], nan=0.0, posinf=0.0, neginf=0.0)
         self._project_mechanics_constraints(nxt)

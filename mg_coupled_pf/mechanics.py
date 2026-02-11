@@ -135,9 +135,26 @@ class MechanicsModel:
         y_coords_um: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         """仅由位移梯度构造线性应变。"""
-        bc = self._mech_bc()
-        dux_dx, dux_dy = grad_xy(ux, dx_um, dy_um, x_coords=x_coords_um, y_coords=y_coords_um, bc=bc)
-        duy_dx, duy_dy = grad_xy(uy, dx_um, dy_um, x_coords=x_coords_um, y_coords=y_coords_um, bc=bc)
+        bc_base = self._mech_bc()
+        bc_ux = bc_base
+        ux_dirichlet = 0.0
+        if self._use_dirichlet_x():
+            # ux 在 x 两端为位移 Dirichlet，梯度离散需显式携带左右边界值（可非零）。
+            if isinstance(bc_base, dict):
+                bc_ux = {"x": "dirichlet0", "y": str(bc_base.get("y", "neumann")).strip().lower()}
+            else:
+                bc_ux = {"x": "dirichlet0", "y": str(bc_base).strip().lower()}
+            ux_dirichlet = {"x_left": 0.0, "x_right": self._dirichlet_right_ux()}
+        dux_dx, dux_dy = grad_xy(
+            ux,
+            dx_um,
+            dy_um,
+            x_coords=x_coords_um,
+            y_coords=y_coords_um,
+            bc=bc_ux,
+            dirichlet_value=ux_dirichlet,
+        )
+        duy_dx, duy_dy = grad_xy(uy, dx_um, dy_um, x_coords=x_coords_um, y_coords=y_coords_um, bc=bc_base)
         ex = dux_dx
         ey = duy_dy
         exy = 0.5 * (dux_dy + duy_dx)

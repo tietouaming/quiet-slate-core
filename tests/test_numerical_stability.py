@@ -9,6 +9,7 @@ import torch
 from mg_coupled_pf import CoupledSimulator, load_config
 from mg_coupled_pf.crystal_plasticity import CrystalPlasticityModel
 from mg_coupled_pf.mechanics import MechanicsModel
+from mg_coupled_pf.operators import double_well_prime, smooth_heaviside, smooth_heaviside_prime
 
 
 def test_short_run_stability() -> None:
@@ -423,3 +424,70 @@ def test_concentration_mass_projection_applied_in_physics_step() -> None:
     sim = CoupledSimulator(cfg)
     sim._physics_step(cfg.numerics.dt_s, 1)
     assert sim.stats["mass_projection_applied"] >= 1
+
+
+def test_phi_residual_uses_allen_cahn_l_times_laplacian_form() -> None:
+    """验证 phi 残差使用 L*(nonlin-kappa*lap) 而非 div(L*kappa*grad)。"""
+    cfg = load_config("configs/notch_case.yaml")
+    cfg.runtime.device = "cpu"
+    cfg.ml.enabled = False
+    cfg.domain.nx = 40
+    cfg.domain.ny = 28
+    cfg.corrosion.include_mech_term_in_phi_variation = False
+    cfg.corrosion.include_twin_grad_term_in_phi_variation = False
+    sim = CoupledSimulator(cfg)
+
+    prev = {k: v.clone() for k, v in sim.state.items()}
+    nxt = {k: v.clone() for k, v in sim.state.items()}
+    # 构造线性 phi 场，便于显式识别是否引入额外 grad(L)·grad(phi) 假项。
+    xx = torch.linspace(0.2, 0.8, cfg.domain.nx, dtype=sim.state["phi"].dtype).view(1, 1, 1, -1)
+    nxt["phi"] = xx.expand_as(prev["phi"])
+    nxt["c"] = torch.full_like(prev["c"], 0.5)
+    nxt["eta"] = torch.zeros_like(prev["eta"])
+    dt = float(cfg.numerics.dt_s)
+
+    mech = sim._estimate_state_mechanics(nxt)
+    got = sim._compute_pde_residuals(prev, nxt, mech, dt_s=dt)
+
+    phi = torch.nan_to_num(nxt["phi"], nan=0.5, posinf=1.0, neginf=0.0)
+    cbar = torch.nan_to_num(nxt["c"], nan=0.5, posinf=cfg.corrosion.cMg_max, neginf=cfg.corrosion.cMg_min)
+    hphi = smooth_heaviside(phi, clamp_input=False)
+    hphi_d = smooth_heaviside_prime(phi, clamp_input=False)
+    delta_eq = cfg.corrosion.c_s_eq_norm - cfg.corrosion.c_l_eq_norm
+    chem_drive = -cfg.corrosion.A_J_m3 / 1e6 * (cbar - hphi * delta_eq - cfg.corrosion.c_l_eq_norm) * delta_eq * hphi_d
+    omega, kappa_phi = sim._omega_kappa_phi()
+    phi_nonlin = chem_drive + omega * double_well_prime(phi, clamp_input=False)
+    L_phi = torch.clamp(sim._corrosion_mobility(state=nxt, mech=mech), min=0.0)
+    phi_lap_kappa = sim._div_diffusive_fv(
+        phi,
+        torch.full_like(phi, float(kappa_phi)),
+        dx=sim.dx_m,
+        dy=sim.dy_m,
+        x_coords=sim.x_coords_m,
+        y_coords=sim.y_coords_m,
+        bc=sim._scalar_bc(),
+    )
+    r_expected = (phi - prev["phi"]) / max(dt, 1e-12) + L_phi * (phi_nonlin - phi_lap_kappa)
+    pde_expected = sim._masked_mean_abs(r_expected)
+    assert abs(float(got["pde_phi"]) - float(pde_expected)) < 1e-10
+
+
+def test_mechanics_dirichlet_nonzero_right_value_enters_ux_gradient() -> None:
+    """验证非零右边界位移会进入 ux 导数离散，而非被当作 0。"""
+    cfg = load_config("configs/notch_case.yaml")
+    cfg.mechanics.loading_mode = "dirichlet_x"
+    cfg.mechanics.dirichlet_right_displacement_um = 1.6
+    cfg.mechanics.mechanics_bc = "neumann"
+    mech = MechanicsModel(cfg)
+
+    h, w = 10, 24
+    ux_line = torch.linspace(0.0, cfg.mechanics.dirichlet_right_displacement_um, w, dtype=torch.float32).view(1, 1, 1, -1)
+    ux = ux_line.expand(1, 1, h, w).clone()
+    uy = torch.zeros_like(ux)
+    eps = mech._disp_strain_only(ux, uy, dx_um=1.0, dy_um=1.0, x_coords_um=None, y_coords_um=None)
+    ex = eps["eps_xx"]
+    # 对线性位移场，内部导数应为常数；最右端一侧差分也应为正，不应塌缩为 0。
+    interior_mean = float(torch.mean(ex[:, :, :, 1:-1]).item())
+    right_mean = float(torch.mean(ex[:, :, :, -1]).item())
+    assert interior_mean > 1e-4
+    assert right_mean > 1e-4

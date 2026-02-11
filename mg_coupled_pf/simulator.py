@@ -270,6 +270,15 @@ class CoupledSimulator:
             out = torch.clamp(out + delta, min=lo, max=hi)
         return out
 
+    @staticmethod
+    def _soft_project_range(x: torch.Tensor, lo: float, hi: float, beta: float = 20.0) -> torch.Tensor:
+        """可微范围投影：区间内近似恒等、区间外平滑回推。"""
+        if hi <= lo:
+            return torch.full_like(x, float(lo))
+        y = (x - float(lo)) / float(hi - lo)
+        y = y - torch.nn.functional.softplus(y - 1.0, beta=beta) / beta + torch.nn.functional.softplus(-y, beta=beta) / beta
+        return float(lo) + (float(hi - lo)) * y
+
     def _masked_mean_abs(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> float:
         """计算带掩膜的面积加权绝对值均值。"""
         ax = torch.abs(torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0))
@@ -417,18 +426,18 @@ class CoupledSimulator:
         """计算 surrogate 候选状态的离散 PDE 残差。"""
         bc = self._scalar_bc()
         dt = max(float(dt_s), 1e-12)
-        phi = torch.clamp(nxt["phi"], 0.0, 1.0)
-        cbar = torch.clamp(nxt["c"], self.cfg.corrosion.cMg_min, self.cfg.corrosion.cMg_max)
-        eta = torch.clamp(nxt["eta"], 0.0, 1.0)
-        hphi = smooth_heaviside(phi)
-        hphi_d = smooth_heaviside_prime(phi)
+        phi = torch.nan_to_num(nxt["phi"], nan=0.5, posinf=1.0, neginf=0.0)
+        cbar = torch.nan_to_num(nxt["c"], nan=0.5, posinf=self.cfg.corrosion.cMg_max, neginf=self.cfg.corrosion.cMg_min)
+        eta = torch.nan_to_num(nxt["eta"], nan=0.0, posinf=1.0, neginf=0.0)
+        hphi = smooth_heaviside(phi, clamp_input=False)
+        hphi_d = smooth_heaviside_prime(phi, clamp_input=False)
         cl_eq = self.cfg.corrosion.c_l_eq_norm
         cs_eq = self.cfg.corrosion.c_s_eq_norm
         delta_eq = cs_eq - cl_eq
         omega, kappa_phi = self._omega_kappa_phi()
 
         chem_drive = -self.cfg.corrosion.A_J_m3 / 1e6 * (cbar - hphi * delta_eq - cl_eq) * delta_eq * hphi_d
-        phi_nonlin = chem_drive + omega * double_well_prime(phi)
+        phi_nonlin = chem_drive + omega * double_well_prime(phi, clamp_input=False)
         if self.cfg.corrosion.include_mech_term_in_phi_variation:
             e_mech = 0.5 * (
                 mech_state["sigma_xx"] * mech_state["sigma_xx"]
@@ -448,21 +457,21 @@ class CoupledSimulator:
             )
             twin_grad_e = 0.5 * self.cfg.twinning.kappa_eta * (gx_eta_um * gx_eta_um + gy_eta_um * gy_eta_um)
             phi_nonlin = phi_nonlin - hphi_d * twin_grad_e
-        L_phi = self._corrosion_mobility(state=nxt, mech=mech_state)
-        phi_diff = self._div_diffusive_fv(
+        L_phi = torch.clamp(self._corrosion_mobility(state=nxt, mech=mech_state), min=0.0)
+        phi_lap_kappa = self._div_diffusive_fv(
             phi,
-            kappa_phi * torch.clamp(L_phi, min=0.0),
+            torch.full_like(phi, float(kappa_phi)),
             dx=self.dx_m,
             dy=self.dy_m,
             x_coords=self.x_coords_m,
             y_coords=self.y_coords_m,
             bc=bc,
         )
-        r_phi = (phi - prev["phi"]) / dt + L_phi * phi_nonlin - phi_diff
+        r_phi = (phi - prev["phi"]) / dt + L_phi * (phi_nonlin - phi_lap_kappa)
         pde_phi = self._masked_mean_abs(r_phi)
 
-        hphi_c = smooth_heaviside(phi)
-        hphi_d_c = smooth_heaviside_prime(phi)
+        hphi_c = smooth_heaviside(phi, clamp_input=False)
+        hphi_d_c = smooth_heaviside_prime(phi, clamp_input=False)
         D = self.cfg.corrosion.D_s_m2_s * hphi_c + (1.0 - hphi_c) * self.cfg.corrosion.D_l_m2_s
         gx_phi, gy_phi = grad_xy(
             phi,
@@ -486,8 +495,8 @@ class CoupledSimulator:
         r_c = (cbar - prev["c"]) / dt - rhs_c
         pde_c = self._masked_mean_abs(r_c)
 
-        heta = smooth_heaviside(eta)
-        heta_d = smooth_heaviside_prime(eta)
+        heta = smooth_heaviside(eta, clamp_input=False)
+        heta_d = smooth_heaviside_prime(eta, clamp_input=False)
         if self.cfg.twinning.scale_twin_gradient_by_hphi:
             grad_coef_eta = self.cfg.twinning.kappa_eta * hphi
         else:
@@ -1119,10 +1128,22 @@ class CoupledSimulator:
         """对状态做数值清洗与物理约束裁剪。"""
         cmin = self.cfg.corrosion.cMg_min
         cmax = self.cfg.corrosion.cMg_max
-        self.state["phi"] = torch.clamp(torch.nan_to_num(self.state["phi"], nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+        self.state["phi"] = self._soft_project_range(
+            torch.nan_to_num(self.state["phi"], nan=0.0, posinf=1.0, neginf=0.0),
+            0.0,
+            1.0,
+        )
         solid = solid_indicator(self.state["phi"], self.cfg.domain.solid_phase_threshold)
-        self.state["c"] = torch.clamp(torch.nan_to_num(self.state["c"], nan=cmin, posinf=cmax, neginf=cmin), cmin, cmax)
-        self.state["eta"] = torch.clamp(torch.nan_to_num(self.state["eta"], nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+        self.state["c"] = self._soft_project_range(
+            torch.nan_to_num(self.state["c"], nan=cmin, posinf=cmax, neginf=cmin),
+            cmin,
+            cmax,
+        )
+        self.state["eta"] = self._soft_project_range(
+            torch.nan_to_num(self.state["eta"], nan=0.0, posinf=1.0, neginf=0.0),
+            0.0,
+            1.0,
+        )
         self.state["eta"] = self.state["eta"] * solid
         self.state["epspeq"] = torch.clamp(
             torch.nan_to_num(self.state["epspeq"], nan=0.0, posinf=1e6, neginf=0.0),
@@ -1337,9 +1358,13 @@ class CoupledSimulator:
                 out["epsp_yy"] = prev["epsp_yy"]
             if "epsp_xy" in prev:
                 out["epsp_xy"] = prev["epsp_xy"]
-        out["phi"] = torch.clamp(out["phi"], 0.0, 1.0)
-        out["c"] = torch.clamp(out["c"], self.cfg.corrosion.cMg_min, self.cfg.corrosion.cMg_max)
-        out["eta"] = torch.clamp(out["eta"], 0.0, 1.0)
+        out["phi"] = self._soft_project_range(torch.nan_to_num(out["phi"], nan=0.5, posinf=1.0, neginf=0.0), 0.0, 1.0)
+        out["c"] = self._soft_project_range(
+            torch.nan_to_num(out["c"], nan=self.cfg.corrosion.cMg_min, posinf=self.cfg.corrosion.cMg_max, neginf=self.cfg.corrosion.cMg_min),
+            self.cfg.corrosion.cMg_min,
+            self.cfg.corrosion.cMg_max,
+        )
+        out["eta"] = self._soft_project_range(torch.nan_to_num(out["eta"], nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
         out["epspeq"] = torch.clamp(out["epspeq"], 0.0, 1e6)
         if "epsp_xx" in out:
             out["epsp_xx"] = torch.clamp(out["epsp_xx"], -1.0, 1.0)
@@ -1491,32 +1516,40 @@ class CoupledSimulator:
 
         L_phi = self._corrosion_mobility()
         phi_nonlin = torch.nan_to_num(phi_nonlin, nan=0.0, posinf=0.0, neginf=0.0)
+        L_phi_pos = torch.clamp(L_phi, min=0.0)
+        kappa_field = torch.full_like(phi, float(kappa_phi))
+        # Allen-Cahn 梯度项：L(phi)*kappa*laplacian(phi)，不可写成 div(L*kappa*grad(phi))。
+        phi_lap_kappa_prev = self._div_diffusive_fv(
+            phi,
+            kappa_field,
+            dx=self.dx_m,
+            dy=self.dy_m,
+            x_coords=self.x_coords_m,
+            y_coords=self.y_coords_m,
+            bc=bc,
+        )
         phi_mode = str(self.cfg.numerics.phi_integrator).strip().lower()
         if phi_mode.startswith("imex"):
-            # IMEX: 非线性显式，扩散型曲率项按变系数隐式推进。
-            rhs_phi = phi - dt_s * L_phi * phi_nonlin
-            diff_phi = kappa_phi * torch.clamp(L_phi, min=0.0)
-            phi_new = self._solve_variable_diffusion_imex(
-                rhs_phi,
-                coeff=dt_s,
-                diff_coef=diff_phi,
-                dx=self.dx_m,
-                dy=self.dy_m,
-                x_coords=self.x_coords_m,
-                y_coords=self.y_coords_m,
-                x0=phi,
-            )
+            # IMEX-L0 分裂：隐式部分使用常数 L0，显式补偿 (L-L0) 项，避免引入 grad(L) 假项。
+            L0 = max(float(self._mean_field(L_phi_pos).item()), 0.0)
+            if L0 > 1e-18:
+                rhs_phi = phi - dt_s * L_phi_pos * phi_nonlin + dt_s * (L_phi_pos - L0) * phi_lap_kappa_prev
+                phi_new = self._solve_variable_diffusion_imex(
+                    rhs_phi,
+                    coeff=dt_s * L0,
+                    diff_coef=kappa_field,
+                    dx=self.dx_m,
+                    dy=self.dy_m,
+                    x_coords=self.x_coords_m,
+                    y_coords=self.y_coords_m,
+                    x0=phi,
+                )
+            else:
+                phi_rhs = -L_phi_pos * phi_nonlin + L_phi_pos * phi_lap_kappa_prev
+                phi_rhs = torch.nan_to_num(phi_rhs, nan=0.0, posinf=0.0, neginf=0.0)
+                phi_new = phi + dt_s * phi_rhs
         else:
-            phi_diff = self._div_diffusive_fv(
-                phi,
-                kappa_phi * torch.clamp(L_phi, min=0.0),
-                dx=self.dx_m,
-                dy=self.dy_m,
-                x_coords=self.x_coords_m,
-                y_coords=self.y_coords_m,
-                bc=bc,
-            )
-            phi_rhs = -L_phi * phi_nonlin + phi_diff
+            phi_rhs = -L_phi_pos * phi_nonlin + L_phi_pos * phi_lap_kappa_prev
             phi_rhs = torch.nan_to_num(phi_rhs, nan=0.0, posinf=0.0, neginf=0.0)
             # 显式更新 phi（旧路径保留，便于 A/B 对照）。
             phi_new = phi + dt_s * phi_rhs

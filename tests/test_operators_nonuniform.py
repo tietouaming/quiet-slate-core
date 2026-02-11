@@ -84,3 +84,20 @@ def test_axis_wise_bc_tuple_and_dict_are_consistent() -> None:
     gx2, gy2 = grad_xy(u, dx=1.0, dy=1.0, bc={"x": "periodic", "y": "neumann"})
     assert torch.allclose(gx1, gx2, atol=1e-12, rtol=1e-12)
     assert torch.allclose(gy1, gy2, atol=1e-12, rtol=1e-12)
+
+
+def test_dirichlet_side_values_are_respected_in_uniform_derivative() -> None:
+    """均匀网格下 x 向左右 Dirichlet 值应分别进入导数离散。"""
+    u = torch.zeros((1, 1, 6, 8), dtype=torch.float64)
+    # 内部为线性场，边界分别固定到不同值。
+    line = torch.linspace(0.0, 1.4, 8, dtype=torch.float64).view(1, 1, 1, -1)
+    u[:] = line
+    gx, _ = grad_xy(
+        u,
+        dx=1.0,
+        dy=1.0,
+        bc={"x": "dirichlet0", "y": "neumann"},
+        dirichlet_value={"x_left": 0.0, "x_right": 1.4},
+    )
+    # 若右侧被错误当成 0，最右端导数会翻成负值；正确应保持非负。
+    assert float(torch.mean(gx[:, :, :, -1]).item()) > 0.0
