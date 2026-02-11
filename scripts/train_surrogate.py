@@ -63,6 +63,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--loss-bounds-weight", type=float, default=0.02)
     p.add_argument("--loss-mass-weight", type=float, default=0.02)
     p.add_argument("--loss-mech-weight", type=float, default=0.01)
+    p.add_argument("--loss-pde-weight", type=float, default=0.05, help="Weight for phi/c/eta discrete PDE residual loss.")
     p.add_argument("--grad-clip", type=float, default=1.0, help="Gradient norm clip; <=0 disables clip.")
     return p.parse_args()
 
@@ -71,9 +72,21 @@ def _load_snapshot_tensor(path: Path) -> torch.Tensor:
     """加载单个快照并拼接为模型通道顺序张量。"""
     # 约定：每个快照里每个字段都是 [1,1,H,W]。
     data = np.load(path)
+    ref = None
+    for k in data.files:
+        arr = data[k]
+        if isinstance(arr, np.ndarray) and arr.ndim == 4 and arr.shape[0] == 1 and arr.shape[1] == 1:
+            ref = arr
+            break
+    if ref is None:
+        raise RuntimeError(f"snapshot {path} does not contain valid [1,1,H,W] fields.")
     chans = []
     for k in FIELD_ORDER:
-        chans.append(data[k])
+        if k in data.files:
+            chans.append(data[k])
+        else:
+            # 兼容旧快照：缺失新通道时以零场补齐。
+            chans.append(np.zeros_like(ref))
     arr = np.concatenate(chans, axis=1)  # [1, C, H, W]
     return torch.from_numpy(arr.astype(np.float32))
 
@@ -180,6 +193,7 @@ def _physics_losses(
     w_bounds: float,
     w_mass: float,
     w_mech: float,
+    w_pde: float,
     rollout_pred_d: torch.Tensor | None = None,
     rollout_target_d: torch.Tensor | None = None,
     rollout_mask: torch.Tensor | None = None,
@@ -197,15 +211,36 @@ def _physics_losses(
     ux = x_pred[:, idx["ux"] : idx["ux"] + 1].float()
     uy = x_pred[:, idx["uy"] : idx["uy"] + 1].float()
     epspeq = x_pred[:, idx["epspeq"] : idx["epspeq"] + 1].float()
+    epsp_xx = x_pred[:, idx["epsp_xx"] : idx["epsp_xx"] + 1].float()
+    epsp_yy = x_pred[:, idx["epsp_yy"] : idx["epsp_yy"] + 1].float()
+    epsp_xy = x_pred[:, idx["epsp_xy"] : idx["epsp_xy"] + 1].float()
 
     # 1) 有界性与“液相无孪晶/无塑性”约束（可微软化并参与反传）。
     b_phi = F.relu(-phi) + F.relu(phi - 1.0)
     b_c = F.relu(-c) + F.relu(c - 1.0)
     b_eta = F.relu(-eta) + F.relu(eta - 1.0)
     b_eps = F.relu(-epspeq)
+    b_epsp_xx = F.relu(torch.abs(epsp_xx) - 1.0)
+    b_epsp_yy = F.relu(torch.abs(epsp_yy) - 1.0)
+    b_epsp_xy = F.relu(torch.abs(epsp_xy) - 1.0)
     liquid_soft = torch.sigmoid((0.5 - torch.clamp(phi, 0.0, 1.0)) * 24.0)
-    liquid_penalty = eta * liquid_soft + epspeq * liquid_soft
-    bounds_loss = torch.mean(b_phi * b_phi + b_c * b_c + b_eta * b_eta + b_eps * b_eps + liquid_penalty * liquid_penalty)
+    liquid_penalty = (
+        eta * liquid_soft
+        + epspeq * liquid_soft
+        + epsp_xx * liquid_soft
+        + epsp_yy * liquid_soft
+        + epsp_xy * liquid_soft
+    )
+    bounds_loss = torch.mean(
+        b_phi * b_phi
+        + b_c * b_c
+        + b_eta * b_eta
+        + b_eps * b_eps
+        + b_epsp_xx * b_epsp_xx
+        + b_epsp_yy * b_epsp_yy
+        + b_epsp_xy * b_epsp_xy
+        + liquid_penalty * liquid_penalty
+    )
 
     # 2) 浓度守恒近似：预测下一步平均浓度应接近监督下一步平均浓度。
     phi_true = x_true[:, idx["phi"] : idx["phi"] + 1].float()
@@ -222,7 +257,7 @@ def _physics_losses(
     dy_um = float(cfg.domain.ly_um) / max(int(cfg.domain.ny) - 1, 1)
     dux_dx, dux_dy = _grad_xy_center(ux, dx_um, dy_um)
     duy_dx, duy_dy = _grad_xy_center(uy, dx_um, dy_um)
-    # 与主求解器一致：扣除孪晶本征应变；塑性项使用 epspeq 的简化各向同性近似。
+    # 与主求解器一致：扣除孪晶本征应变与塑性张量分量。
     ang_s = math.radians(float(cfg.twinning.twin_shear_dir_angle_deg))
     ang_n = math.radians(float(cfg.twinning.twin_plane_normal_angle_deg))
     sx, sy = math.cos(ang_s), math.sin(ang_s)
@@ -232,12 +267,11 @@ def _physics_losses(
     eps_tw_xx = h_eta * gamma_tw * sx * nx
     eps_tw_yy = h_eta * gamma_tw * sy * ny
     eps_tw_xy = h_eta * 0.5 * gamma_tw * (sx * ny + sy * nx)
-    epsp_iso = torch.clamp(epspeq, min=0.0) * 0.5
     loading_mode = str(getattr(cfg.mechanics, "loading_mode", "eigenstrain")).strip().lower()
     ext_x = float(cfg.mechanics.external_strain_x) if loading_mode not in {"dirichlet_x", "dirichlet", "ux_dirichlet"} else 0.0
-    ex = dux_dx + ext_x - epsp_iso - eps_tw_xx
-    ey = duy_dy - epsp_iso - eps_tw_yy
-    exy = 0.5 * (dux_dy + duy_dx) - eps_tw_xy
+    ex = dux_dx + ext_x - epsp_xx - eps_tw_xx
+    ey = duy_dy - epsp_yy - eps_tw_yy
+    exy = 0.5 * (dux_dy + duy_dx) - epsp_xy - eps_tw_xy
     lam = float(cfg.mechanics.lambda_GPa) * 1e3
     mu = float(cfg.mechanics.mu_GPa) * 1e3
     tr = ex + ey
@@ -256,6 +290,54 @@ def _physics_losses(
     mech_norm = max((lam + 2.0 * mu) ** 2, 1e-9)
     mech_loss = torch.mean((res_x * res_x + res_y * res_y) / mech_norm)
 
+    # 4) 离散 PDE 残差：约束 surrogate 学到“物理可行”的时间推进。
+    dt = max(float(cfg.numerics.dt_s), 1e-12)
+    dx_m = dx_um * 1e-6
+    dy_m = dy_um * 1e-6
+    p = torch.clamp(phi, 0.0, 1.0)
+    hphi_p = _smooth_heaviside(p)
+    hphi_d = 30.0 * p * p * (p - 1.0) * (p - 1.0)
+    c_l = float(cfg.corrosion.c_l_eq_norm)
+    c_s = float(cfg.corrosion.c_s_eq_norm)
+    delta_eq = c_s - c_l
+    gamma = float(cfg.corrosion.gamma_J_m2)
+    ell_m = max(float(cfg.corrosion.interface_thickness_um) * 1e-6, 1e-12)
+    omega = 3.0 * gamma / (4.0 * ell_m) / 1e6
+    kappa_phi = 1.5 * gamma * ell_m / 1e6
+    phi_dw_prime = 32.0 * p * (1.0 - p) * (1.0 - 2.0 * p)
+    chem_drive = -float(cfg.corrosion.A_J_m3) / 1e6 * (c - hphi_p * delta_eq - c_l) * delta_eq * hphi_d
+    phi_nonlin = chem_drive + omega * phi_dw_prime
+    L0 = float(cfg.corrosion.L0)
+    gx_phi_m, gy_phi_m = _grad_xy_center(phi, dx_m, dy_m)
+    dflux_phi_x_dx, dflux_phi_y_dy = _div_center(kappa_phi * L0 * gx_phi_m, kappa_phi * L0 * gy_phi_m, dx_m, dy_m)
+    pde_phi = (pred_d[:, idx["phi"] : idx["phi"] + 1].float() / dt) + L0 * phi_nonlin - (dflux_phi_x_dx + dflux_phi_y_dy)
+
+    D_l = float(cfg.corrosion.D_l_m2_s)
+    D_s = float(cfg.corrosion.D_s_m2_s)
+    D = D_s * hphi_p + (1.0 - hphi_p) * D_l
+    gx_c_m, gy_c_m = _grad_xy_center(c, dx_m, dy_m)
+    corr = hphi_d * (c_l - c_s)
+    jx = -D * (gx_c_m + corr * gx_phi_m)
+    jy = -D * (gy_c_m + corr * gy_phi_m)
+    djx_dx, djy_dy = _div_center(jx, jy, dx_m, dy_m)
+    rhs_c = -(djx_dx + djy_dy)
+    pde_c = (pred_d[:, idx["c"] : idx["c"] + 1].float() / dt) - rhs_c
+
+    eta_p = torch.clamp(eta, 0.0, 1.0)
+    heta = _smooth_heaviside(eta_p)
+    heta_d = 30.0 * eta_p * eta_p * (eta_p - 1.0) * (eta_p - 1.0)
+    k_eta = float(cfg.twinning.kappa_eta)
+    grad_coef_eta = k_eta * hphi_p if bool(cfg.twinning.scale_twin_gradient_by_hphi) else torch.full_like(hphi_p, k_eta)
+    twin_dw = hphi_p * 2.0 * float(cfg.twinning.W_barrier_MPa) * eta_p * (1.0 - eta_p) * (1.0 - 2.0 * eta_p)
+    tau_tw = sx * (sig_xx * nx + sig_xy * ny) + sy * (sig_xy * nx + sig_yy * ny)
+    tw_drive = hphi_p * tau_tw * float(cfg.twinning.gamma_twin) * heta_d
+    gx_eta_um, gy_eta_um = _grad_xy_center(eta_p, dx_um, dy_um)
+    dgx_eta_dx, dgy_eta_dy = _div_center(grad_coef_eta * gx_eta_um, grad_coef_eta * gy_eta_um, dx_um, dy_um)
+    grad_term_eta = dgx_eta_dx + dgy_eta_dy
+    eta_rhs = twin_dw - tw_drive - grad_term_eta
+    pde_eta = (pred_d[:, idx["eta"] : idx["eta"] + 1].float() / dt) + float(cfg.twinning.L_eta) * eta_rhs
+    pde_loss = torch.mean(pde_phi * pde_phi + pde_c * pde_c + pde_eta * pde_eta)
+
     rollout_loss = torch.tensor(0.0, device=pred_d.device, dtype=pred_d.dtype)
     if (
         rollout_pred_d is not None
@@ -272,6 +354,7 @@ def _physics_losses(
         + w_bounds * bounds_loss
         + w_mass * mass_loss
         + w_mech * mech_loss
+        + w_pde * pde_loss
         + rollout_weight * rollout_loss
     )
     scalars = {
@@ -279,6 +362,7 @@ def _physics_losses(
         "bounds": float(bounds_loss.detach().item()),
         "mass": float(mass_loss.detach().item()),
         "mech": float(mech_loss.detach().item()),
+        "pde": float(pde_loss.detach().item()),
         "rollout": float(rollout_loss.detach().item()),
     }
     return loss, scalars
@@ -391,6 +475,7 @@ def main() -> None:
     w_bounds = float(max(args.loss_bounds_weight, 0.0))
     w_mass = float(max(args.loss_mass_weight, 0.0))
     w_mech = float(max(args.loss_mech_weight, 0.0))
+    w_pde = float(max(args.loss_pde_weight, 0.0))
     grad_clip = float(args.grad_clip)
     if args.streaming:
         # 4A) 流式模式：边读边训，适合长时大数据快照。
@@ -428,7 +513,7 @@ def main() -> None:
     for epoch in range(1, cfg.ml.train_epochs + 1):
         model.train()
         train_loss = 0.0
-        train_comp = {"data": 0.0, "bounds": 0.0, "mass": 0.0, "mech": 0.0, "rollout": 0.0}
+        train_comp = {"data": 0.0, "bounds": 0.0, "mass": 0.0, "mech": 0.0, "pde": 0.0, "rollout": 0.0}
         train_count = 0
         if args.streaming:
             for xb, db, db2, m2 in train_loader:
@@ -456,6 +541,7 @@ def main() -> None:
                         w_bounds=w_bounds,
                         w_mass=w_mass,
                         w_mech=w_mech,
+                        w_pde=w_pde,
                         rollout_pred_d=roll_pred,
                         rollout_target_d=db2,
                         rollout_mask=m2,
@@ -499,6 +585,7 @@ def main() -> None:
                         w_bounds=w_bounds,
                         w_mass=w_mass,
                         w_mech=w_mech,
+                        w_pde=w_pde,
                         rollout_pred_d=roll_pred,
                         rollout_target_d=db2,
                         rollout_mask=m2,
@@ -524,7 +611,7 @@ def main() -> None:
             with torch.no_grad():
                 if args.streaming and val_loader is not None:
                     vloss = 0.0
-                    vcomp = {"data": 0.0, "bounds": 0.0, "mass": 0.0, "mech": 0.0, "rollout": 0.0}
+                    vcomp = {"data": 0.0, "bounds": 0.0, "mass": 0.0, "mech": 0.0, "pde": 0.0, "rollout": 0.0}
                     vcount = 0
                     for xb, db, db2, m2 in val_loader:
                         xb = xb.to(device, non_blocking=True)
@@ -548,6 +635,7 @@ def main() -> None:
                             w_bounds=w_bounds,
                             w_mass=w_mass,
                             w_mech=w_mech,
+                            w_pde=w_pde,
                             rollout_pred_d=roll_pred,
                             rollout_target_d=db2,
                             rollout_mask=m2,
@@ -584,6 +672,7 @@ def main() -> None:
                         w_bounds=w_bounds,
                         w_mass=w_mass,
                         w_mech=w_mech,
+                        w_pde=w_pde,
                         rollout_pred_d=roll_pred,
                         rollout_target_d=db2,
                         rollout_mask=m2,
@@ -602,9 +691,9 @@ def main() -> None:
         print(
             f"epoch {epoch:03d} train={train_loss:.6e} val={val_loss:.6e} "
             f"| train[data={train_comp['data']:.2e},bounds={train_comp['bounds']:.2e},mass={train_comp['mass']:.2e},"
-            f"mech={train_comp['mech']:.2e},roll={train_comp['rollout']:.2e}] "
+            f"mech={train_comp['mech']:.2e},pde={train_comp['pde']:.2e},roll={train_comp['rollout']:.2e}] "
             f"| val[data={vcomp['data']:.2e},bounds={vcomp['bounds']:.2e},mass={vcomp['mass']:.2e},"
-            f"mech={vcomp['mech']:.2e},roll={vcomp['rollout']:.2e}]"
+            f"mech={vcomp['mech']:.2e},pde={vcomp['pde']:.2e},roll={vcomp['rollout']:.2e}]"
         )
 
     if best_state is not None:
@@ -627,6 +716,7 @@ def main() -> None:
                     "bounds": w_bounds,
                     "mass": w_mass,
                     "mech": w_mech,
+                    "pde": w_pde,
                     "rollout": rollout_weight,
                 },
                 "rollout_steps": rollout_steps,

@@ -242,7 +242,21 @@ def initial_fields(cfg: SimulationConfig, grid: Grid2D) -> dict[str, torch.Tenso
     ux = torch.zeros_like(phi)
     uy = torch.zeros_like(phi)
     epspeq = torch.zeros_like(phi)
-    return {"phi": phi, "c": c, "eta": eta, "ux": ux, "uy": uy, "epspeq": epspeq}
+    # 为 surrogate 与训练数据提供完整塑性张量通道（与 epspeq 并存）。
+    epsp_xx = torch.zeros_like(phi)
+    epsp_yy = torch.zeros_like(phi)
+    epsp_xy = torch.zeros_like(phi)
+    return {
+        "phi": phi,
+        "c": c,
+        "eta": eta,
+        "ux": ux,
+        "uy": uy,
+        "epspeq": epspeq,
+        "epsp_xx": epsp_xx,
+        "epsp_yy": epsp_yy,
+        "epsp_xy": epsp_xy,
+    }
 
 
 def pitting_mobility_field(cfg: SimulationConfig, grid: Grid2D) -> torch.Tensor:

@@ -8,6 +8,7 @@ import torch
 
 from mg_coupled_pf import CoupledSimulator, load_config
 from mg_coupled_pf.crystal_plasticity import CrystalPlasticityModel
+from mg_coupled_pf.mechanics import MechanicsModel
 
 
 def test_short_run_stability() -> None:
@@ -285,3 +286,24 @@ def test_mechanics_dirichlet_x_boundary_enforced() -> None:
     right = ux[:, :, :, -1]
     assert float(torch.max(torch.abs(left)).item()) < 1e-8
     assert float(torch.max(torch.abs(right - 0.05)).item()) < 1e-6
+
+
+def test_plane_strain_sigma_h_includes_sigma_zz() -> None:
+    """验证平面应变下 sigma_h 计算包含 sigma_zz 分量。"""
+    cfg = load_config("configs/notch_case.yaml")
+    cfg.mechanics.plane_strain = True
+    mech = MechanicsModel(cfg)
+    phi = torch.ones((1, 1, 4, 5), dtype=torch.float32)
+    ex = torch.full_like(phi, 0.01)
+    ey = torch.full_like(phi, -0.002)
+    exy = torch.full_like(phi, 0.0)
+    sig = mech.constitutive_stress(phi, ex, ey, exy)
+    lam = cfg.mechanics.lambda_GPa * 1e3
+    mu = cfg.mechanics.mu_GPa * 1e3
+    tr = ex + ey
+    sxx = lam * tr + 2.0 * mu * ex
+    syy = lam * tr + 2.0 * mu * ey
+    szz = lam * tr
+    sh_ref = (sxx + syy + szz) / 3.0
+    err = torch.max(torch.abs(sig["sigma_h"] - sh_ref)).item()
+    assert err < 1e-6

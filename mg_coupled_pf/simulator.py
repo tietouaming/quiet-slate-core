@@ -118,11 +118,20 @@ class CoupledSimulator:
         self.pitting_field = pitting_mobility_field(cfg, self.grid)
 
         z = torch.zeros_like(self.state["phi"])
-        self.epsp = {"exx": z.clone(), "eyy": z.clone(), "exy": z.clone()}
+        # 塑性张量内部表示与 state 通道保持同步，便于 surrogate 与物理步共享。
+        self.epsp = {
+            "exx": self.state.get("epsp_xx", z).clone(),
+            "eyy": self.state.get("epsp_yy", z).clone(),
+            "exy": self.state.get("epsp_xy", z).clone(),
+        }
+        self.state["epsp_xx"] = self.epsp["exx"].clone()
+        self.state["epsp_yy"] = self.epsp["eyy"].clone()
+        self.state["epsp_xy"] = self.epsp["exy"].clone()
         self.last_mech = {
             "sigma_xx": z.clone(),
             "sigma_yy": z.clone(),
             "sigma_xy": z.clone(),
+            "sigma_zz": z.clone(),
             "sigma_h": z.clone(),
         }
 
@@ -231,13 +240,29 @@ class CoupledSimulator:
         den = torch.clamp(self._mean_field(m), min=1e-12)
         return float((num / den).item())
 
+    def _epsp_from_state(self, state: Dict[str, torch.Tensor] | None = None) -> Dict[str, torch.Tensor]:
+        """从 state 字典读取塑性张量；缺失时回退到内部缓存。"""
+        st = self.state if state is None else state
+        return {
+            "exx": st.get("epsp_xx", self.epsp["exx"]),
+            "eyy": st.get("epsp_yy", self.epsp["eyy"]),
+            "exy": st.get("epsp_xy", self.epsp["exy"]),
+        }
+
+    def _sync_epsp_to_state(self) -> None:
+        """将内部塑性张量同步到主 state。"""
+        self.state["epsp_xx"] = self.epsp["exx"]
+        self.state["epsp_yy"] = self.epsp["eyy"]
+        self.state["epsp_xy"] = self.epsp["exy"]
+
     def _estimate_state_mechanics(self, state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """根据给定位移场快速估计应变/应力（不做平衡迭代）。"""
+        epsp_state = self._epsp_from_state(state)
         eps = self.mech._strain_from_displacement(
             state["ux"],
             state["uy"],
             state["eta"],
-            self.epsp,
+            epsp_state,
             self.dx_um,
             self.dy_um,
             x_coords_um=self.x_coords_um,
@@ -253,6 +278,7 @@ class CoupledSimulator:
             "sigma_xx": torch.nan_to_num(sig["sigma_xx"], nan=0.0, posinf=0.0, neginf=0.0),
             "sigma_yy": torch.nan_to_num(sig["sigma_yy"], nan=0.0, posinf=0.0, neginf=0.0),
             "sigma_xy": torch.nan_to_num(sig["sigma_xy"], nan=0.0, posinf=0.0, neginf=0.0),
+            "sigma_zz": torch.nan_to_num(sig["sigma_zz"], nan=0.0, posinf=0.0, neginf=0.0),
             "sigma_h": torch.nan_to_num(sig["sigma_h"], nan=0.0, posinf=0.0, neginf=0.0),
         }
         return out
@@ -355,25 +381,35 @@ class CoupledSimulator:
             ) / max(self.cfg.mechanics.mu_GPa * 1e3, 1e-9)
             phi_nonlin = phi_nonlin - hphi_d * e_mech
         if self.cfg.corrosion.include_twin_grad_term_in_phi_variation and self.cfg.twinning.scale_twin_gradient_by_hphi:
-            gx_eta_m, gy_eta_m = grad_xy(
+            # 与 eta-TDGL 保持一致：kappa_eta 与 eta 梯度统一采用 um 尺度。
+            gx_eta_um, gy_eta_um = grad_xy(
                 eta,
-                self.dx_m,
-                self.dy_m,
-                x_coords=self.x_coords_m,
-                y_coords=self.y_coords_m,
+                self.dx_um,
+                self.dy_um,
+                x_coords=self.x_coords_um,
+                y_coords=self.y_coords_um,
             )
-            twin_grad_e = 0.5 * self.cfg.twinning.kappa_eta * (gx_eta_m * gx_eta_m + gy_eta_m * gy_eta_m)
+            twin_grad_e = 0.5 * self.cfg.twinning.kappa_eta * (gx_eta_um * gx_eta_um + gy_eta_um * gy_eta_um)
             phi_nonlin = phi_nonlin - hphi_d * twin_grad_e
         L_phi = self._corrosion_mobility(state=nxt, mech=mech_state)
-        lap_phi = laplacian(
+        gx_phi_impl, gy_phi_impl = grad_xy(
             phi,
             self.dx_m,
             self.dy_m,
             x_coords=self.x_coords_m,
             y_coords=self.y_coords_m,
         )
-        phi_rhs = phi_nonlin - kappa_phi * lap_phi
-        r_phi = (phi - prev["phi"]) / dt + L_phi * phi_rhs
+        diff_phi_x = kappa_phi * L_phi * gx_phi_impl
+        diff_phi_y = kappa_phi * L_phi * gy_phi_impl
+        phi_diff = divergence(
+            diff_phi_x,
+            diff_phi_y,
+            self.dx_m,
+            self.dy_m,
+            x_coords=self.x_coords_m,
+            y_coords=self.y_coords_m,
+        )
+        r_phi = (phi - prev["phi"]) / dt + L_phi * phi_nonlin - phi_diff
         pde_phi = self._masked_mean_abs(r_phi)
 
         hphi_c = smooth_heaviside(phi)
@@ -458,6 +494,8 @@ class CoupledSimulator:
                     vv = torch.clamp(vv, 0.0, 1.0)
                 elif k == "epspeq":
                     vv = torch.clamp(vv, 0.0, 1e6)
+                elif k in {"epsp_xx", "epsp_yy", "epsp_xy"}:
+                    vv = torch.clamp(vv, -1.0, 1.0)
                 pert[k] = vv
             pred = self.surrogate.predict(pert)
             dphi = self._masked_mean_abs(pred["phi"] - prev["phi"])
@@ -773,11 +811,36 @@ class CoupledSimulator:
             1e6,
         )
         self.state["epspeq"] = self.state["epspeq"] * solid
+        self.state["epsp_xx"] = torch.clamp(
+            torch.nan_to_num(self.state.get("epsp_xx", self.epsp["exx"]), nan=0.0, posinf=0.0, neginf=0.0),
+            min=-1.0,
+            max=1.0,
+        ) * solid
+        self.state["epsp_yy"] = torch.clamp(
+            torch.nan_to_num(self.state.get("epsp_yy", self.epsp["eyy"]), nan=0.0, posinf=0.0, neginf=0.0),
+            min=-1.0,
+            max=1.0,
+        ) * solid
+        self.state["epsp_xy"] = torch.clamp(
+            torch.nan_to_num(self.state.get("epsp_xy", self.epsp["exy"]), nan=0.0, posinf=0.0, neginf=0.0),
+            min=-1.0,
+            max=1.0,
+        ) * solid
+        self.epsp["exx"] = self.state["epsp_xx"]
+        self.epsp["eyy"] = self.state["epsp_yy"]
+        self.epsp["exy"] = self.state["epsp_xy"]
         self.last_mech = {k: torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0) for k, v in self.last_mech.items()}
-        for k in ("sigma_xx", "sigma_yy", "sigma_xy", "sigma_h"):
-            self.last_mech[k] = self.last_mech[k] * solid
+        for k in ("sigma_xx", "sigma_yy", "sigma_xy", "sigma_zz", "sigma_h"):
+            if k in self.last_mech:
+                self.last_mech[k] = self.last_mech[k] * solid
 
-    def _surrogate_update_is_valid(self, prev: Dict[str, torch.Tensor], nxt: Dict[str, torch.Tensor]) -> bool:
+    def _surrogate_update_is_valid(
+        self,
+        prev: Dict[str, torch.Tensor],
+        nxt: Dict[str, torch.Tensor],
+        *,
+        candidate_mech: Dict[str, torch.Tensor] | None = None,
+    ) -> bool:
         """判断 surrogate 提议步是否通过门控。"""
         def reject(reason: str) -> bool:
             key = f"ml_reject_{reason}"
@@ -816,6 +879,19 @@ class CoupledSimulator:
         if eps_abs_delta > 0.0:
             if abs(float(self._mean_field(nxt["epspeq"] - prev["epspeq"]).item())) > eps_abs_delta:
                 return reject("eps_mean_delta")
+            z_eps = torch.zeros_like(prev["epspeq"])
+            prev_epsp_xx = prev.get("epsp_xx", z_eps)
+            prev_epsp_yy = prev.get("epsp_yy", z_eps)
+            prev_epsp_xy = prev.get("epsp_xy", z_eps)
+            nxt_epsp_xx = nxt.get("epsp_xx", prev_epsp_xx)
+            nxt_epsp_yy = nxt.get("epsp_yy", prev_epsp_yy)
+            nxt_epsp_xy = nxt.get("epsp_xy", prev_epsp_xy)
+            if abs(float(self._mean_field(nxt_epsp_xx - prev_epsp_xx).item())) > eps_abs_delta:
+                return reject("eps_mean_delta")
+            if abs(float(self._mean_field(nxt_epsp_yy - prev_epsp_yy).item())) > eps_abs_delta:
+                return reject("eps_mean_delta")
+            if abs(float(self._mean_field(nxt_epsp_xy - prev_epsp_xy).item())) > eps_abs_delta:
+                return reject("eps_mean_delta")
 
         if self.cfg.ml.max_field_delta > 0.0:
             gate = self.cfg.ml.max_field_delta
@@ -838,6 +914,11 @@ class CoupledSimulator:
         liquid_eps = float(self._mean_field(torch.abs(nxt["epspeq"] * liquid)).item())
         if liquid_eps > max(self.cfg.ml.max_mean_epspeq_abs_delta, 1e-6):
             return reject("liquid_eps")
+        liquid_eps_xx = float(self._mean_field(torch.abs(nxt.get("epsp_xx", torch.zeros_like(liquid)) * liquid)).item())
+        liquid_eps_yy = float(self._mean_field(torch.abs(nxt.get("epsp_yy", torch.zeros_like(liquid)) * liquid)).item())
+        liquid_eps_xy = float(self._mean_field(torch.abs(nxt.get("epsp_xy", torch.zeros_like(liquid)) * liquid)).item())
+        if max(liquid_eps_xx, liquid_eps_yy, liquid_eps_xy) > max(self.cfg.ml.max_mean_epspeq_abs_delta, 1e-6):
+            return reject("liquid_eps")
         rel = dphi + dc + deta
         if rel > self.cfg.ml.residual_gate:
             return reject("residual_gate")
@@ -849,7 +930,7 @@ class CoupledSimulator:
                 return reject("uncertainty")
 
         mech_prev = self._estimate_state_mechanics(prev)
-        mech_nxt = self._estimate_state_mechanics(nxt)
+        mech_nxt = candidate_mech if candidate_mech is not None else self._estimate_state_mechanics(nxt)
 
         if bool(self.cfg.ml.enable_pde_residual_gate):
             residuals = self._compute_pde_residuals(prev, nxt, mech_nxt, self.cfg.numerics.dt_s)
@@ -910,14 +991,32 @@ class CoupledSimulator:
             limit_field("ux", 0.5)
             limit_field("uy", 0.5)
             limit_field("epspeq", 0.2)
+            if "epsp_xx" in prev and "epsp_xx" in nxt:
+                limit_field("epsp_xx", 0.2)
+            if "epsp_yy" in prev and "epsp_yy" in nxt:
+                limit_field("epsp_yy", 0.2)
+            if "epsp_xy" in prev and "epsp_xy" in nxt:
+                limit_field("epsp_xy", 0.2)
         else:
             out["ux"] = prev["ux"]
             out["uy"] = prev["uy"]
             out["epspeq"] = prev["epspeq"]
+            if "epsp_xx" in prev:
+                out["epsp_xx"] = prev["epsp_xx"]
+            if "epsp_yy" in prev:
+                out["epsp_yy"] = prev["epsp_yy"]
+            if "epsp_xy" in prev:
+                out["epsp_xy"] = prev["epsp_xy"]
         out["phi"] = torch.clamp(out["phi"], 0.0, 1.0)
         out["c"] = torch.clamp(out["c"], self.cfg.corrosion.cMg_min, self.cfg.corrosion.cMg_max)
         out["eta"] = torch.clamp(out["eta"], 0.0, 1.0)
         out["epspeq"] = torch.clamp(out["epspeq"], 0.0, 1e6)
+        if "epsp_xx" in out:
+            out["epsp_xx"] = torch.clamp(out["epsp_xx"], -1.0, 1.0)
+        if "epsp_yy" in out:
+            out["epsp_yy"] = torch.clamp(out["epsp_yy"], -1.0, 1.0)
+        if "epsp_xy" in out:
+            out["epsp_xy"] = torch.clamp(out["epsp_xy"], -1.0, 1.0)
         return out
 
     def _physics_step(self, dt_s: float, step_idx: int) -> None:
@@ -1004,6 +1103,9 @@ class CoupledSimulator:
                 self.last_mech = mech_predict
                 self.stats["mech_correct_skipped_elastic"] += 1
 
+        # 无论力学本步是否更新，都保持 state 与内部塑性张量同步。
+        self._sync_epsp_to_state()
+
         # 2) 腐蚀 + 扩散 + 孪晶演化
         phi = self.state["phi"]
         cbar = self.state["c"]
@@ -1030,26 +1132,28 @@ class CoupledSimulator:
             phi_nonlin = phi_nonlin - hphi_d * e_mech
 
         if self.cfg.corrosion.include_twin_grad_term_in_phi_variation and self.cfg.twinning.scale_twin_gradient_by_hphi:
-            gx_eta_m, gy_eta_m = grad_xy(
+            # 与 eta 方程使用相同的长度单位，避免 kappa_eta 量纲失配。
+            gx_eta_um, gy_eta_um = grad_xy(
                 eta,
-                self.dx_m,
-                self.dy_m,
-                x_coords=self.x_coords_m,
-                y_coords=self.y_coords_m,
+                self.dx_um,
+                self.dy_um,
+                x_coords=self.x_coords_um,
+                y_coords=self.y_coords_um,
             )
-            twin_grad_e = 0.5 * self.cfg.twinning.kappa_eta * (gx_eta_m * gx_eta_m + gy_eta_m * gy_eta_m)
+            twin_grad_e = 0.5 * self.cfg.twinning.kappa_eta * (gx_eta_um * gx_eta_um + gy_eta_um * gy_eta_um)
             phi_nonlin = phi_nonlin - hphi_d * twin_grad_e
 
         L_phi = self._corrosion_mobility()
         phi_nonlin = torch.nan_to_num(phi_nonlin, nan=0.0, posinf=0.0, neginf=0.0)
         phi_mode = str(self.cfg.numerics.phi_integrator).strip().lower()
         if phi_mode.startswith("imex"):
-            # IMEX: 非线性显式，界面曲率项隐式（Helmholtz）。
+            # IMEX: 非线性显式，扩散型曲率项按变系数隐式推进。
             rhs_phi = phi - dt_s * L_phi * phi_nonlin
-            alpha_phi = dt_s * kappa_phi * max(float(self._mean_field(L_phi).item()), 0.0)
-            phi_new = self._solve_helmholtz_imex(
+            diff_phi = kappa_phi * torch.clamp(L_phi, min=0.0)
+            phi_new = self._solve_variable_diffusion_imex(
                 rhs_phi,
-                alpha=alpha_phi,
+                coeff=dt_s,
+                diff_coef=diff_phi,
                 dx=self.dx_m,
                 dy=self.dy_m,
                 x_coords=self.x_coords_m,
@@ -1057,16 +1161,25 @@ class CoupledSimulator:
                 x0=phi,
             )
         else:
-            phi_rhs = phi_nonlin - kappa_phi * laplacian(
+            gx_phi_impl, gy_phi_impl = grad_xy(
                 phi,
                 self.dx_m,
                 self.dy_m,
                 x_coords=self.x_coords_m,
                 y_coords=self.y_coords_m,
             )
+            phi_diff = divergence(
+                kappa_phi * torch.clamp(L_phi, min=0.0) * gx_phi_impl,
+                kappa_phi * torch.clamp(L_phi, min=0.0) * gy_phi_impl,
+                self.dx_m,
+                self.dy_m,
+                x_coords=self.x_coords_m,
+                y_coords=self.y_coords_m,
+            )
+            phi_rhs = -L_phi * phi_nonlin + phi_diff
             phi_rhs = torch.nan_to_num(phi_rhs, nan=0.0, posinf=0.0, neginf=0.0)
             # 显式更新 phi（旧路径保留，便于 A/B 对照）。
-            phi_new = phi - dt_s * L_phi * phi_rhs
+            phi_new = phi + dt_s * phi_rhs
         phi_new = torch.clamp(phi_new, 0.0, 1.0)
         phi_new = torch.nan_to_num(phi_new, nan=0.0, posinf=1.0, neginf=0.0)
 
@@ -1099,19 +1212,21 @@ class CoupledSimulator:
         # 孪晶 TDGL 方程推进。
         heta = smooth_heaviside(eta)
         heta_d = smooth_heaviside_prime(eta)
+        # TDGL 与固液界面耦合应使用最新 phi，避免“先错算再投影”。
+        hphi_eta = smooth_heaviside(phi_new)
         k_eta = self.cfg.twinning.kappa_eta
-        grad_coef_eta = k_eta * hphi
+        grad_coef_eta = k_eta * hphi_eta
         w_t = self.cfg.twinning.W_barrier_MPa
-        twin_dw = hphi * 2.0 * w_t * eta * (1.0 - eta) * (1.0 - 2.0 * eta)
+        twin_dw = hphi_eta * 2.0 * w_t * eta * (1.0 - eta) * (1.0 - 2.0 * eta)
         tau_tw = self._resolved_twin_shear(self.last_mech["sigma_xx"], self.last_mech["sigma_yy"], self.last_mech["sigma_xy"])
         # 正向驱动：分解剪应力 * 孪晶剪切量 * 势函数导数。
-        tw_drive = hphi * tau_tw * self.cfg.twinning.gamma_twin * heta_d
+        tw_drive = hphi_eta * tau_tw * self.cfg.twinning.gamma_twin * heta_d
 
         # 在缺口附近且分解剪应力超过阈值时引入成核扰动。
         r2 = (self.grid.x_um - self.cfg.domain.notch_tip_x_um) ** 2 + (self.grid.y_um - self.cfg.domain.notch_center_y_um) ** 2
         nuc = torch.exp(-r2 / max(self.cfg.twinning.nucleation_center_radius_um ** 2, 1e-12))
         act = torch.relu(torch.abs(tau_tw) - self.cfg.twinning.twin_crss_MPa)
-        langevin = hphi * self.cfg.twinning.langevin_nucleation_noise * nuc * act
+        langevin = hphi_eta * self.cfg.twinning.langevin_nucleation_noise * nuc * act
 
         eta_source = twin_dw - tw_drive - langevin
         eta_source = torch.nan_to_num(eta_source, nan=0.0, posinf=0.0, neginf=0.0)
@@ -1190,12 +1305,25 @@ class CoupledSimulator:
                         self.stats["ml_surrogate_attempt"] += 1
                         pred = self.surrogate.predict(self.state)
                         pred = self._limit_surrogate_update(self.state, pred)
-                        if self._surrogate_update_is_valid(self.state, pred):
+                        gate_mech: Dict[str, torch.Tensor] | None = None
+                        if self.cfg.ml.enable_surrogate_mechanics_correction:
+                            # 门控与执行必须使用一致的力学状态，避免“过门后再变系统”。
+                            gate_mech = self.mech.solve_quasi_static(
+                                pred,
+                                self._epsp_from_state(pred),
+                                self.dx_um,
+                                self.dy_um,
+                                x_coords_um=self.x_coords_um,
+                                y_coords_um=self.y_coords_um,
+                            )
+                        if self._surrogate_update_is_valid(self.state, pred, candidate_mech=gate_mech):
                             self.stats["ml_surrogate_accept"] += 1
                             self.state = pred
+                            self.epsp = self._epsp_from_state(self.state)
+                            self._sync_epsp_to_state()
                             if self.cfg.ml.enable_surrogate_mechanics_correction:
                                 # 可选：对 surrogate 状态再做一次力学校正。
-                                self.last_mech = self.mech.solve_quasi_static(
+                                self.last_mech = gate_mech if gate_mech is not None else self.mech.solve_quasi_static(
                                     self.state,
                                     self.epsp,
                                     self.dx_um,
@@ -1353,6 +1481,7 @@ class CoupledSimulator:
                         "sigma_xx": self.last_mech["sigma_xx"],
                         "sigma_yy": self.last_mech["sigma_yy"],
                         "sigma_xy": self.last_mech["sigma_xy"],
+                        "sigma_zz": self.last_mech["sigma_zz"],
                     },
                 )
                 if self.cfg.runtime.render_intermediate_fields:

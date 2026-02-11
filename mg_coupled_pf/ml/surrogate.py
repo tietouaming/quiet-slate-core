@@ -20,12 +20,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-FIELD_ORDER = ["phi", "c", "eta", "ux", "uy", "epspeq"]
+FIELD_ORDER = ["phi", "c", "eta", "ux", "uy", "epspeq", "epsp_xx", "epsp_yy", "epsp_xy"]
 
 
 def state_to_tensor(state: Dict[str, torch.Tensor]) -> torch.Tensor:
     """按固定通道顺序将状态字典拼接为网络输入。"""
-    return torch.cat([state[k] for k in FIELD_ORDER], dim=1)
+    if not state:
+        raise ValueError("state_to_tensor received empty state.")
+    ref = next(iter(state.values()))
+    chans: List[torch.Tensor] = []
+    for k in FIELD_ORDER:
+        if k in state:
+            chans.append(state[k])
+        else:
+            # 兼容旧状态字典：缺失通道以零场填充。
+            chans.append(torch.zeros_like(ref))
+    return torch.cat(chans, dim=1)
 
 
 def tensor_to_state(x: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -334,9 +344,15 @@ class SurrogatePredictor:
         nxt["ux"] = torch.nan_to_num(nxt["ux"], nan=0.0, posinf=0.0, neginf=0.0)
         nxt["uy"] = torch.nan_to_num(nxt["uy"], nan=0.0, posinf=0.0, neginf=0.0)
         nxt["epspeq"] = torch.clamp(nxt["epspeq"], 0.0, 1e6)
+        nxt["epsp_xx"] = torch.clamp(torch.nan_to_num(nxt["epsp_xx"], nan=0.0, posinf=0.0, neginf=0.0), min=-1.0, max=1.0)
+        nxt["epsp_yy"] = torch.clamp(torch.nan_to_num(nxt["epsp_yy"], nan=0.0, posinf=0.0, neginf=0.0), min=-1.0, max=1.0)
+        nxt["epsp_xy"] = torch.clamp(torch.nan_to_num(nxt["epsp_xy"], nan=0.0, posinf=0.0, neginf=0.0), min=-1.0, max=1.0)
         solid = (nxt["phi"] >= 0.5).to(dtype=nxt["phi"].dtype)
         nxt["eta"] = nxt["eta"] * solid
         nxt["epspeq"] = nxt["epspeq"] * solid
+        nxt["epsp_xx"] = nxt["epsp_xx"] * solid
+        nxt["epsp_yy"] = nxt["epsp_yy"] * solid
+        nxt["epsp_xy"] = nxt["epsp_xy"] * solid
         return nxt
 
 
@@ -535,7 +551,13 @@ def load_surrogate(
         afno_expansion=float(arch_kwargs.get("afno_expansion", 2.0)),
     )
     state_dict = payload["state_dict"] if isinstance(payload, dict) and "state_dict" in payload else payload
-    predictor.model.load_state_dict(state_dict)
+    # 兼容旧 checkpoint（输入通道数变更时会出现 shape mismatch）。
+    model_sd = predictor.model.state_dict()
+    filtered: Dict[str, torch.Tensor] = {}
+    for k, v in state_dict.items():
+        if k in model_sd and tuple(model_sd[k].shape) == tuple(v.shape):
+            filtered[k] = v
+    predictor.model.load_state_dict(filtered, strict=False)
     predictor.model.eval()
     predictor.model = _maybe_compile(predictor.model, use_torch_compile)
     predictor.model_arch = arch

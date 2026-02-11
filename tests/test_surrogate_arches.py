@@ -43,3 +43,17 @@ def test_build_predict_save_load_all_arches(tmp_path: Path) -> None:
         for k in FIELD_ORDER:
             assert y2[k].shape == x[k].shape
             assert torch.isfinite(y2[k]).all()
+
+
+def test_predict_compatible_with_legacy_state_without_epsp_tensor_channels() -> None:
+    """验证 surrogate 对旧版 state（无 epsp_xx/yy/xy）仍可推理。"""
+    dev = torch.device("cpu")
+    p = build_surrogate(device=dev, use_torch_compile=False, channels_last=False, model_arch="tiny_unet", hidden=12)
+    x = _state(dev, h=16, w=20)
+    x.pop("epsp_xx")
+    x.pop("epsp_yy")
+    x.pop("epsp_xy")
+    y = p.predict(x)
+    for k in FIELD_ORDER:
+        assert k in y
+        assert y[k].shape == (1, 1, 16, 20)

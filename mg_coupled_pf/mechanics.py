@@ -79,8 +79,19 @@ class MechanicsModel:
         sigma_xx = hphi * (self.lam * tr + 2.0 * self.mu * eps_xx)
         sigma_yy = hphi * (self.lam * tr + 2.0 * self.mu * eps_yy)
         sigma_xy = hphi * (2.0 * self.mu * eps_xy)
-        sigma_h = (sigma_xx + sigma_yy) / 3.0
-        return {"sigma_xx": sigma_xx, "sigma_yy": sigma_yy, "sigma_xy": sigma_xy, "sigma_h": sigma_h}
+        if bool(self.cfg.mechanics.plane_strain):
+            # 平面应变下 ezz=0，但 szz=lambda*(exx+eyy) 一般不为 0。
+            sigma_zz = hphi * (self.lam * tr)
+        else:
+            sigma_zz = torch.zeros_like(sigma_xx)
+        sigma_h = (sigma_xx + sigma_yy + sigma_zz) / 3.0
+        return {
+            "sigma_xx": sigma_xx,
+            "sigma_yy": sigma_yy,
+            "sigma_xy": sigma_xy,
+            "sigma_zz": sigma_zz,
+            "sigma_h": sigma_h,
+        }
 
     def _apply_displacement_constraints(self, ux: torch.Tensor, uy: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """对位移场施加边界约束。"""
