@@ -1,0 +1,53 @@
+domain:
+  nx: 1024
+  ny: 512
+  lx_um: 400.0
+  ly_um: 250.0
+  mesh_refine_near_notch: true
+  mesh_refine_strength_x: 12.0
+  mesh_refine_strength_y: 10.0
+  mesh_refine_sigma_x_um: 24.0
+  mesh_refine_sigma_y_um: 16.0
+  mesh_refine_samples: 24000
+  interface_width_um: 0.97
+  initial_geometry: half_space
+  half_space_direction: x
+  half_space_interface_x_um: -1.0
+  half_space_solid_on_lower_side: true
+  add_half_space_triangular_notch: true
+  half_space_notch_tip_x_um: 140.0
+  half_space_notch_center_y_um: 125.0
+  half_space_notch_depth_um: 100.0
+  half_space_notch_half_opening_um: 25.0
+  half_space_notch_open_to_positive_x: true
+  half_space_notch_sharpness_um: 0.25
+  tip_zoom_width_um: 12.0
+  tip_zoom_height_um: 9.0
+  add_initial_pit_seed: false
+
+numerics:
+  dt_s: 0.001
+  n_steps: 500
+  save_every: 500
+  mechanics_substeps: 14
+  mechanics_relaxation: 0.2
+  mechanics_update_every: 20
+  use_torch_compile: true
+  mixed_precision: true
+  inference_mode: true
+  dtype: float32
+  diffusion_auto_substeps: true
+  diffusion_dt_safety: 0.9
+  diffusion_substeps_cap: 256
+
+ml:
+  enabled: false
+
+runtime:
+  device: cuda
+  output_dir: artifacts/sim_notch
+  case_name: mg_half_half_mech20_0p5s
+  clean_output: true
+  render_intermediate_fields: false
+  render_final_clouds: false
+  render_grid_figure: false

@@ -1,0 +1,17 @@
+runtime:
+  device: cuda
+  output_dir: artifacts/sim_notch
+  case_name: mg_notch_2d_gpu
+  clean_output: true
+  render_intermediate_fields: true
+  render_final_clouds: true
+
+numerics:
+  use_torch_compile: true
+  mixed_precision: true
+  inference_mode: true
+  dtype: float32
+
+ml:
+  enabled: true
+  rollout_every: 3

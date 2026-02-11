@@ -1,0 +1,82 @@
+domain:
+  nx: 1024
+  ny: 512
+  lx_um: 400.0
+  ly_um: 250.0
+  mesh_refine_near_notch: true
+  mesh_refine_strength_x: 12.0
+  mesh_refine_strength_y: 10.0
+  mesh_refine_sigma_x_um: 24.0
+  mesh_refine_sigma_y_um: 16.0
+  mesh_refine_samples: 24000
+  interface_width_um: 0.97
+  initial_geometry: half_space
+  half_space_direction: x
+  half_space_interface_x_um: -1.0
+  half_space_solid_on_lower_side: true
+  add_half_space_triangular_notch: true
+  half_space_notch_tip_x_um: 140.0
+  half_space_notch_center_y_um: 125.0
+  half_space_notch_depth_um: 100.0
+  half_space_notch_half_opening_um: 25.0
+  half_space_notch_open_to_positive_x: true
+  half_space_notch_sharpness_um: 0.25
+  tip_zoom_width_um: 12.0
+  tip_zoom_height_um: 9.0
+  add_initial_pit_seed: false
+
+numerics:
+  dt_s: 0.005
+  n_steps: 1000
+  save_every: 200
+  mechanics_substeps: 14
+  mechanics_adaptive_substeps: true
+  mechanics_min_substeps: 2
+  mechanics_residual_tol: 80.0
+  mechanics_residual_rel_tol: 0.06
+  mechanics_relaxation: 0.2
+  mechanics_update_every: 1
+  use_torch_compile: true
+  mixed_precision: true
+  inference_mode: true
+  dtype: float32
+  diffusion_auto_substeps: true
+  diffusion_dt_safety: 0.9
+  diffusion_substeps_cap: 256
+  diffusion_integrator: sts
+  diffusion_sts_nu: 0.0005
+  diffusion_sts_max_stages: 96
+
+ml:
+  enabled: true
+  mode: predictor_corrector
+  model_path: artifacts/ml/surrogate_afno_latest.pt
+  model_arch: afno2d
+  afno_width: 12
+  afno_modes_x: 8
+  afno_modes_y: 6
+  afno_depth: 2
+  afno_expansion: 1.25
+  rollout_every: 1
+  enable_surrogate_mechanics_correction: true
+  anchor_physics_every: 20
+  residual_gate: 0.12
+  max_field_delta: 0.012
+  max_mean_phi_drop: 0.0012
+  max_mean_eta_rise: 0.004
+  max_mean_phi_abs_delta: 0.00045
+  max_mean_eta_abs_delta: 0.0005
+  max_mean_c_abs_delta: 0.0015
+  max_mean_epspeq_abs_delta: 0.00025
+  max_consecutive_reject_before_pause: 4
+  pause_steps_after_reject_burst: 120
+  disable_surrogate_after_reject_burst: false
+
+runtime:
+  device: cuda
+  output_dir: artifacts/sim_notch
+  case_name: mg_half_half_tri_notch_highres_fast_ml_afno
+  clean_output: true
+  render_intermediate_fields: false
+  render_final_clouds: true
+  render_grid_figure: true

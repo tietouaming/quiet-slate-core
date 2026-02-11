@@ -1,0 +1,163 @@
+domain:
+  nx: 256
+  ny: 160
+  lx_um: 400.0
+  ly_um: 250.0
+  notch_tip_x_um: 80.0
+  notch_center_y_um: 125.0
+  notch_depth_um: 55.0
+  notch_half_opening_um: 28.0
+  interface_width_um: 2.0
+  initial_pit_radius_um: 1.5
+
+numerics:
+  dt_s: 0.0001
+  n_steps: 1200
+  save_every: 100
+  mechanics_substeps: 12
+  mechanics_solver: hybrid_cg_relax
+  mechanics_krylov_method: gmres
+  mechanics_cg_max_iters: 120
+  mechanics_cg_tol_abs: 5.0
+  mechanics_cg_tol_rel: 0.005
+  mechanics_cg_diag_shift: 1.0e-6
+  mechanics_gmres_restart: 24
+  mechanics_gmres_max_restarts: 6
+  mechanics_krylov_fail_streak_to_pause: 3
+  mechanics_krylov_pause_steps: 30
+  mechanics_relaxation: 0.22
+  seed: 42
+  use_torch_compile: true
+  mixed_precision: false
+  inference_mode: true
+  dtype: float32
+
+corrosion:
+  # Kovacevic et al. (Acta Biomaterialia, 2023)
+  D_l_m2_s: 0.0000000001
+  D_s_m2_s: 0.0000000000001
+  c_l_eq_mol_L: 0.57
+  c_s_eq_mol_L: 71.44
+  # Governing equation uses normalized cMg: liquid=0, solid=1
+  c_l_eq_norm: 0.0
+  c_s_eq_norm: 1.0
+  cMg_init_liquid: 0.0
+  cMg_init_solid: 1.0
+  cMg_min: 0.0
+  cMg_max: 1.0
+  gamma_J_m2: 0.5
+  interface_thickness_um: 4.0
+  A_J_m3: 60000000.0
+  temperature_K: 310.15
+  molar_volume_m3_mol: 1.3998e-5
+  L0: 5.0e-8
+  pitting_beta: 0.75
+  pitting_alpha: 3.0
+  pitting_N: 2
+  pitting_min_factor: 0.2
+  pitting_max_factor: 5.0
+  yield_strain_for_mech: 0.002
+  include_mech_term_in_phi_variation: false
+  include_twin_grad_term_in_phi_variation: false
+
+twinning:
+  # From the provided Mg CP-twinning doc (simplified 2D implementation)
+  L_eta: 0.1295
+  W_barrier_MPa: 8.86
+  kappa_eta: 0.006
+  h_power: 3
+  gamma_twin: 0.129
+  twin_crss_MPa: 30.0
+  twin_shear_dir_angle_deg: 35.0
+  twin_plane_normal_angle_deg: 125.0
+  scale_twin_gradient_by_hphi: true
+  langevin_nucleation_noise: 0.0002
+  nucleation_center_radius_um: 3.0
+
+crystal_plasticity:
+  gamma0_s_inv: 1.0
+  m_rate_sensitivity: 20.0
+  h_MPa: 120.0
+  q_latent: 0.5
+  use_overstress: true
+  gamma_dot_max_s_inv: 50.0
+  hardening_rate_cap_MPa_s: 20000.0
+  basal_crss_MPa: 13.0
+  prismatic_crss_MPa: 57.0
+  pyramidal_crss_MPa: 100.0
+  slip_systems_file: configs/slip_systems_hcp_2d.json
+
+mechanics:
+  # Values as referenced in your CP-twinning material
+  C11_GPa: 63.5
+  C12_GPa: 25.9
+  C13_GPa: 21.7
+  C33_GPa: 66.5
+  C44_GPa: 18.4
+  # Isotropic equivalent used by this initial code version
+  lambda_GPa: 38.0
+  mu_GPa: 16.3
+  # loading_mode:
+  # - eigenstrain: use external_strain_x as macro strain term
+  # - dirichlet_x: use left/right displacement boundary loading
+  loading_mode: eigenstrain
+  external_strain_x: 0.001
+  # only used when loading_mode=dirichlet_x; <0 means auto = external_strain_x*lx_um
+  dirichlet_right_displacement_um: -1.0
+  plane_strain: true
+  residual_damping_MPa_um: 80.0
+  max_abs_displacement_um: 0.0
+  max_abs_strain: 0.1
+
+ml:
+  enabled: true
+  mode: predictor_corrector
+  model_path: artifacts/ml/surrogate_latest.pt
+  train_epochs: 30
+  train_batch_size: 8
+  train_lr: 0.0005
+  train_split: 0.9
+  rollout_every: 3
+  residual_gate: 0.5
+  max_field_delta: 0.06
+  max_mean_phi_drop: 0.002
+  max_mean_eta_rise: 0.01
+  max_mean_phi_abs_delta: 0.0008
+  max_mean_eta_abs_delta: 0.001
+  max_mean_c_abs_delta: 0.005
+  max_mean_epspeq_abs_delta: 0.0005
+  enable_pde_residual_gate: true
+  pde_residual_phi_abs_max: 0.08
+  pde_residual_c_abs_max: 0.08
+  pde_residual_eta_abs_max: 0.08
+  pde_residual_mech_abs_max: 120.0
+  enable_energy_gate: true
+  energy_abs_increase_max: 0.05
+  energy_rel_increase_max: 0.002
+  enable_uncertainty_gate: false
+  uncertainty_samples: 3
+  uncertainty_jitter_std: 0.0005
+  uncertainty_gate: 0.025
+  adaptive_rollout: true
+  rollout_min_every: 1
+  rollout_max_every: 8
+  rollout_success_streak_to_increase: 6
+  rollout_reject_streak_to_decrease: 2
+  enable_surrogate_mechanics_correction: true
+  max_consecutive_reject_before_pause: 8
+  pause_steps_after_reject_burst: 120
+  disable_surrogate_after_reject_burst: true
+
+extensions:
+  enable_electric_field: false
+  enable_hydrogen_embrittlement: false
+  electric_field_strength_V_m: 0.0
+  hydrogen_reference_ppm: 0.0
+
+runtime:
+  device: auto
+  output_dir: artifacts/sim_notch
+  case_name: mg_notch_2d
+  clean_output: true
+  render_intermediate_fields: true
+  render_final_clouds: true

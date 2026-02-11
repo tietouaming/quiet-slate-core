@@ -1,0 +1,27 @@
+domain:
+  nx: 512
+  ny: 320
+  lx_um: 400.0
+  ly_um: 250.0
+
+numerics:
+  dt_s: 0.00005
+  n_steps: 1600
+  save_every: 200
+  mechanics_substeps: 14
+  mechanics_relaxation: 0.2
+  use_torch_compile: true
+  mixed_precision: true
+  inference_mode: true
+  dtype: float32
+
+ml:
+  enabled: false
+
+runtime:
+  device: cuda
+  output_dir: artifacts/sim_notch
+  case_name: mg_notch_2d_highres
+  clean_output: true
+  render_intermediate_fields: false
+  render_final_clouds: true

@@ -1,0 +1,33 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+
+# Virtual environments
+.venv/
+.venv*/
+venv/
+env/
+
+# Local data (as requested)
+data/
+
+# Build/report artifacts
+artifacts/
+core_code_backup_*/
+core_code_backup_clean_*/
+*.log
+
+# Archives (as requested)
+*.zip
+*.7z
+*.tar
+*.gz
+*.rar
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,1433 @@
+"""主耦合求解器模块（中文注释版）。
+
+本模块是项目核心，负责在每个物理时间步内完成：
+1. 力学平衡与晶体塑性更新；
+2. 腐蚀相场与浓度扩散推进；
+3. 孪晶序参数演化；
+4. ML surrogate 与物理步之间的门控切换；
+5. 历史量记录、快照与可视化输出。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from contextlib import nullcontext
+import math
+import time
+from pathlib import Path
+from typing import Dict, List
+
+import torch
+
+from .config import SimulationConfig
+from .couplers import build_couplers
+from .crystal_plasticity import CrystalPlasticityModel
+from .geometry import Grid2D, initial_fields, make_grid, pitting_mobility_field
+from .io_utils import ensure_dir, render_fields, render_final_clouds, render_grid_figure, save_history_csv, save_snapshot_npz
+from .mechanics import MechanicsModel
+from .ml.surrogate import load_surrogate
+from .operators import (
+    divergence,
+    double_well,
+    double_well_prime,
+    grad_xy,
+    laplacian,
+    smooth_heaviside,
+    smooth_heaviside_prime,
+    solid_indicator,
+)
+
+
+def _torch_dtype(name: str) -> torch.dtype:
+    """字符串 dtype 映射到 torch dtype。"""
+    if name == "float64":
+        return torch.float64
+    return torch.float32
+
+
+def _fmt_wall_time(seconds: float) -> str:
+    """将秒数格式化为 `MM:SS.xx` 或 `HH:MM:SS.xx`。"""
+    s = max(float(seconds), 0.0)
+    h = int(s // 3600.0)
+    m = int((s % 3600.0) // 60.0)
+    sec = s - 3600.0 * h - 60.0 * m
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{sec:05.2f}"
+    return f"{m:02d}:{sec:05.2f}"
+
+
+@dataclass
+class StepDiagnostics:
+    """单步诊断量。"""
+    step: int
+    time_s: float
+    solid_fraction: float
+    avg_eta: float
+    max_sigma_h: float
+    avg_epspeq: float
+    used_surrogate_only: bool
+    loss_phi_mae: float = 0.0
+    loss_c_mae: float = 0.0
+    loss_eta_mae: float = 0.0
+    loss_epspeq_mae: float = 0.0
+    free_energy: float = 0.0
+    pde_res_phi: float = 0.0
+    pde_res_c: float = 0.0
+    pde_res_eta: float = 0.0
+    pde_res_mech: float = 0.0
+    rollout_every: int = 1
+
+
+class CoupledSimulator:
+    """镁合金腐蚀-孪晶-晶体塑性耦合求解器。"""
+    def __init__(self, cfg: SimulationConfig):
+        """初始化网格、场变量、子模型与可选 surrogate。"""
+        self.cfg = cfg
+        self.device = self._pick_device(cfg.runtime.device)
+        self.dtype = _torch_dtype(cfg.numerics.dtype)
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")
+        torch.manual_seed(cfg.numerics.seed)
+        self.grid: Grid2D = make_grid(cfg, self.device, self.dtype)
+        self.dx_um = self.grid.dx_min_um
+        self.dy_um = self.grid.dy_min_um
+        self.dx_m = self.dx_um * 1e-6
+        self.dy_m = self.dy_um * 1e-6
+        self.x_coords_um = self.grid.x_vec_um
+        self.y_coords_um = self.grid.y_vec_um
+        self.x_coords_m = self.x_coords_um * 1e-6
+        self.y_coords_m = self.y_coords_um * 1e-6
+        self.area_weights = self._build_area_weights(self.x_coords_um, self.y_coords_um)
+        self.diffusion_dt_limit_s = self._estimate_diffusion_dt_limit()
+        self._diffusion_stage_cache: Dict[float, List[float]] = {}
+
+        ang_s = torch.deg2rad(torch.tensor(cfg.twinning.twin_shear_dir_angle_deg, device=self.device, dtype=self.dtype))
+        ang_n = torch.deg2rad(torch.tensor(cfg.twinning.twin_plane_normal_angle_deg, device=self.device, dtype=self.dtype))
+        self.twin_sx = torch.cos(ang_s)
+        self.twin_sy = torch.sin(ang_s)
+        self.twin_nx = torch.cos(ang_n)
+        self.twin_ny = torch.sin(ang_n)
+
+        self.state = initial_fields(cfg, self.grid)
+        self.couplers = build_couplers(cfg)
+        self.cp = CrystalPlasticityModel(cfg, self.device, self.dtype)
+        self.cp_state = self.cp.init_state(cfg.domain.ny, cfg.domain.nx)
+        self.mech = MechanicsModel(cfg)
+        self.pitting_field = pitting_mobility_field(cfg, self.grid)
+
+        z = torch.zeros_like(self.state["phi"])
+        self.epsp = {"exx": z.clone(), "eyy": z.clone(), "exy": z.clone()}
+        self.last_mech = {
+            "sigma_xx": z.clone(),
+            "sigma_yy": z.clone(),
+            "sigma_xy": z.clone(),
+            "sigma_h": z.clone(),
+        }
+
+        self.surrogate = None
+        if cfg.ml.enabled:
+            p = Path(cfg.ml.model_path)
+            if p.exists():
+                self.surrogate = load_surrogate(
+                    p,
+                    device=self.device,
+                    use_torch_compile=cfg.numerics.use_torch_compile and self.device.type == "cuda",
+                    fallback_model_arch=cfg.ml.model_arch,
+                    fallback_arch_kwargs={
+                        "hidden": cfg.ml.model_hidden,
+                        "dw_hidden": cfg.ml.dw_hidden,
+                        "dw_depth": cfg.ml.dw_depth,
+                        "fno_width": cfg.ml.fno_width,
+                        "fno_modes_x": cfg.ml.fno_modes_x,
+                        "fno_modes_y": cfg.ml.fno_modes_y,
+                        "fno_depth": cfg.ml.fno_depth,
+                        "afno_width": cfg.ml.afno_width,
+                        "afno_modes_x": cfg.ml.afno_modes_x,
+                        "afno_modes_y": cfg.ml.afno_modes_y,
+                        "afno_depth": cfg.ml.afno_depth,
+                        "afno_expansion": cfg.ml.afno_expansion,
+                    },
+                )
+        self._surrogate_reject_streak = 0
+        self._surrogate_pause_until_step = 0
+        self._current_rollout_every = max(1, int(cfg.ml.rollout_every))
+        self._rollout_success_streak = 0
+        self._rollout_reject_streak = 0
+        self._last_gate_metrics: Dict[str, float] = {
+            "free_energy": 0.0,
+            "pde_phi": 0.0,
+            "pde_c": 0.0,
+            "pde_eta": 0.0,
+            "pde_mech": 0.0,
+            "uncertainty": 0.0,
+        }
+
+        self.history: List[Dict[str, float]] = []
+        self.stats: Dict[str, int] = {
+            "mech_predict_solve": 0,
+            "mech_correct_solve": 0,
+            "mech_correct_skipped_elastic": 0,
+            "mech_cg_converged": 0,
+            "mech_cg_failed": 0,
+            "mech_cg_iters_sum": 0,
+            "mech_ml_initial_guess_used": 0,
+            "ml_surrogate_attempt": 0,
+            "ml_surrogate_accept": 0,
+            "ml_surrogate_reject": 0,
+            "ml_reject_phi_drop": 0,
+            "ml_reject_eta_rise": 0,
+            "ml_reject_phi_mean_delta": 0,
+            "ml_reject_eta_mean_delta": 0,
+            "ml_reject_c_mean_delta": 0,
+            "ml_reject_eps_mean_delta": 0,
+            "ml_reject_phi_field_delta": 0,
+            "ml_reject_eta_field_delta": 0,
+            "ml_reject_c_field_delta": 0,
+            "ml_reject_liquid_eta": 0,
+            "ml_reject_liquid_eps": 0,
+            "ml_reject_residual_gate": 0,
+            "ml_reject_pde_phi": 0,
+            "ml_reject_pde_c": 0,
+            "ml_reject_pde_eta": 0,
+            "ml_reject_pde_mech": 0,
+            "ml_reject_energy": 0,
+            "ml_reject_uncertainty": 0,
+            "ml_rollout_increase": 0,
+            "ml_rollout_decrease": 0,
+        }
+
+    def _build_area_weights(self, x_coords_um: torch.Tensor, y_coords_um: torch.Tensor) -> torch.Tensor:
+        """构造面积加权矩阵，用于非均匀网格上的加权平均。"""
+        def nodal_weights(v: torch.Tensor) -> torch.Tensor:
+            if v.numel() < 2:
+                return torch.ones_like(v)
+            dv = v[1:] - v[:-1]
+            w = torch.zeros_like(v)
+            w[0] = 0.5 * dv[0]
+            w[-1] = 0.5 * dv[-1]
+            if v.numel() > 2:
+                w[1:-1] = 0.5 * (dv[1:] + dv[:-1])
+            return torch.clamp(w, min=1e-12)
+
+        wx = nodal_weights(x_coords_um)
+        wy = nodal_weights(y_coords_um)
+        w2 = wy[:, None] * wx[None, :]
+        w2 = w2 / torch.clamp(torch.sum(w2), min=1e-12)
+        return w2[None, None]
+
+    def _mean_field(self, x: torch.Tensor) -> torch.Tensor:
+        """计算全域面积加权平均。"""
+        return torch.sum(x * self.area_weights)
+
+    def _masked_mean_abs(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> float:
+        """计算带掩膜的面积加权绝对值均值。"""
+        ax = torch.abs(torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0))
+        if mask is None:
+            return float(self._mean_field(ax).item())
+        m = torch.clamp(torch.nan_to_num(mask, nan=0.0, posinf=1.0, neginf=0.0), min=0.0, max=1.0)
+        num = self._mean_field(ax * m)
+        den = torch.clamp(self._mean_field(m), min=1e-12)
+        return float((num / den).item())
+
+    def _estimate_state_mechanics(self, state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """根据给定位移场快速估计应变/应力（不做平衡迭代）。"""
+        eps = self.mech._strain_from_displacement(
+            state["ux"],
+            state["uy"],
+            state["eta"],
+            self.epsp,
+            self.dx_um,
+            self.dy_um,
+            x_coords_um=self.x_coords_um,
+            y_coords_um=self.y_coords_um,
+        )
+        sig = self.mech.constitutive_stress(state["phi"], eps["eps_xx"], eps["eps_yy"], eps["eps_xy"])
+        out = {
+            "ux": torch.nan_to_num(state["ux"], nan=0.0, posinf=0.0, neginf=0.0),
+            "uy": torch.nan_to_num(state["uy"], nan=0.0, posinf=0.0, neginf=0.0),
+            "eps_xx": torch.nan_to_num(eps["eps_xx"], nan=0.0, posinf=0.0, neginf=0.0),
+            "eps_yy": torch.nan_to_num(eps["eps_yy"], nan=0.0, posinf=0.0, neginf=0.0),
+            "eps_xy": torch.nan_to_num(eps["eps_xy"], nan=0.0, posinf=0.0, neginf=0.0),
+            "sigma_xx": torch.nan_to_num(sig["sigma_xx"], nan=0.0, posinf=0.0, neginf=0.0),
+            "sigma_yy": torch.nan_to_num(sig["sigma_yy"], nan=0.0, posinf=0.0, neginf=0.0),
+            "sigma_xy": torch.nan_to_num(sig["sigma_xy"], nan=0.0, posinf=0.0, neginf=0.0),
+            "sigma_h": torch.nan_to_num(sig["sigma_h"], nan=0.0, posinf=0.0, neginf=0.0),
+        }
+        return out
+
+    def _compute_mechanics_residual(self, mech_state: Dict[str, torch.Tensor], phi: torch.Tensor) -> float:
+        """计算 `div(sigma)=0` 的离散残差均值（仅固相统计）。"""
+        res_x = divergence(
+            mech_state["sigma_xx"],
+            mech_state["sigma_xy"],
+            self.dx_um,
+            self.dy_um,
+            x_coords=self.x_coords_um,
+            y_coords=self.y_coords_um,
+        )
+        res_y = divergence(
+            mech_state["sigma_xy"],
+            mech_state["sigma_yy"],
+            self.dx_um,
+            self.dy_um,
+            x_coords=self.x_coords_um,
+            y_coords=self.y_coords_um,
+        )
+        solid = solid_indicator(phi, self.cfg.domain.solid_phase_threshold)
+        return 0.5 * (
+            self._masked_mean_abs(res_x, solid)
+            + self._masked_mean_abs(res_y, solid)
+        )
+
+    def _compute_free_energy(self, state: Dict[str, torch.Tensor], mech_state: Dict[str, torch.Tensor]) -> float:
+        """计算离散总自由能密度（面积加权平均）。"""
+        phi = torch.clamp(state["phi"], 0.0, 1.0)
+        cbar = torch.clamp(state["c"], self.cfg.corrosion.cMg_min, self.cfg.corrosion.cMg_max)
+        eta = torch.clamp(state["eta"], 0.0, 1.0)
+        hphi = smooth_heaviside(phi)
+        cl_eq = self.cfg.corrosion.c_l_eq_norm
+        cs_eq = self.cfg.corrosion.c_s_eq_norm
+        delta_eq = cs_eq - cl_eq
+        A_mpa = self.cfg.corrosion.A_J_m3 / 1e6
+        omega, kappa_phi = self._omega_kappa_phi()
+        chem = 0.5 * A_mpa * (cbar - hphi * delta_eq - cl_eq) ** 2
+        phi_dw = omega * double_well(phi)
+        gx_phi, gy_phi = grad_xy(
+            phi,
+            self.dx_m,
+            self.dy_m,
+            x_coords=self.x_coords_m,
+            y_coords=self.y_coords_m,
+        )
+        grad_phi = 0.5 * kappa_phi * (gx_phi * gx_phi + gy_phi * gy_phi)
+        eta_barrier = hphi * self.cfg.twinning.W_barrier_MPa * eta * eta * (1.0 - eta) * (1.0 - eta)
+        gx_eta, gy_eta = grad_xy(
+            eta,
+            self.dx_um,
+            self.dy_um,
+            x_coords=self.x_coords_um,
+            y_coords=self.y_coords_um,
+        )
+        if self.cfg.twinning.scale_twin_gradient_by_hphi:
+            grad_coef_eta = self.cfg.twinning.kappa_eta * hphi
+        else:
+            grad_coef_eta = torch.full_like(phi, float(self.cfg.twinning.kappa_eta))
+        grad_eta = 0.5 * grad_coef_eta * (gx_eta * gx_eta + gy_eta * gy_eta)
+        eps_xx = mech_state["eps_xx"]
+        eps_yy = mech_state["eps_yy"]
+        eps_xy = mech_state["eps_xy"]
+        sigma_xx = mech_state["sigma_xx"]
+        sigma_yy = mech_state["sigma_yy"]
+        sigma_xy = mech_state["sigma_xy"]
+        elastic = 0.5 * (sigma_xx * eps_xx + sigma_yy * eps_yy + 2.0 * sigma_xy * eps_xy)
+        total = chem + phi_dw + grad_phi + eta_barrier + grad_eta + elastic
+        total = torch.nan_to_num(total, nan=0.0, posinf=0.0, neginf=0.0)
+        return float(self._mean_field(total).item())
+
+    def _compute_pde_residuals(
+        self,
+        prev: Dict[str, torch.Tensor],
+        nxt: Dict[str, torch.Tensor],
+        mech_state: Dict[str, torch.Tensor],
+        dt_s: float,
+    ) -> Dict[str, float]:
+        """计算 surrogate 候选状态的离散 PDE 残差。"""
+        dt = max(float(dt_s), 1e-12)
+        phi = torch.clamp(nxt["phi"], 0.0, 1.0)
+        cbar = torch.clamp(nxt["c"], self.cfg.corrosion.cMg_min, self.cfg.corrosion.cMg_max)
+        eta = torch.clamp(nxt["eta"], 0.0, 1.0)
+        hphi = smooth_heaviside(phi)
+        hphi_d = smooth_heaviside_prime(phi)
+        cl_eq = self.cfg.corrosion.c_l_eq_norm
+        cs_eq = self.cfg.corrosion.c_s_eq_norm
+        delta_eq = cs_eq - cl_eq
+        omega, kappa_phi = self._omega_kappa_phi()
+
+        chem_drive = -self.cfg.corrosion.A_J_m3 / 1e6 * (cbar - hphi * delta_eq - cl_eq) * delta_eq * hphi_d
+        phi_nonlin = chem_drive + omega * double_well_prime(phi)
+        if self.cfg.corrosion.include_mech_term_in_phi_variation:
+            e_mech = 0.5 * (
+                mech_state["sigma_xx"] * mech_state["sigma_xx"]
+                + mech_state["sigma_yy"] * mech_state["sigma_yy"]
+                + 2.0 * mech_state["sigma_xy"] * mech_state["sigma_xy"]
+            ) / max(self.cfg.mechanics.mu_GPa * 1e3, 1e-9)
+            phi_nonlin = phi_nonlin - hphi_d * e_mech
+        if self.cfg.corrosion.include_twin_grad_term_in_phi_variation and self.cfg.twinning.scale_twin_gradient_by_hphi:
+            gx_eta_m, gy_eta_m = grad_xy(
+                eta,
+                self.dx_m,
+                self.dy_m,
+                x_coords=self.x_coords_m,
+                y_coords=self.y_coords_m,
+            )
+            twin_grad_e = 0.5 * self.cfg.twinning.kappa_eta * (gx_eta_m * gx_eta_m + gy_eta_m * gy_eta_m)
+            phi_nonlin = phi_nonlin - hphi_d * twin_grad_e
+        L_phi = self._corrosion_mobility(state=nxt, mech=mech_state)
+        lap_phi = laplacian(
+            phi,
+            self.dx_m,
+            self.dy_m,
+            x_coords=self.x_coords_m,
+            y_coords=self.y_coords_m,
+        )
+        phi_rhs = phi_nonlin - kappa_phi * lap_phi
+        r_phi = (phi - prev["phi"]) / dt + L_phi * phi_rhs
+        pde_phi = self._masked_mean_abs(r_phi)
+
+        hphi_c = smooth_heaviside(phi)
+        hphi_d_c = smooth_heaviside_prime(phi)
+        D = self.cfg.corrosion.D_s_m2_s * hphi_c + (1.0 - hphi_c) * self.cfg.corrosion.D_l_m2_s
+        gx_phi, gy_phi = grad_xy(phi, self.dx_m, self.dy_m, x_coords=self.x_coords_m, y_coords=self.y_coords_m)
+        corr = hphi_d_c * (cl_eq - cs_eq)
+        rhs_c = self._diffusion_rhs(
+            cbar,
+            D,
+            corr,
+            gx_phi,
+            gy_phi,
+            phi,
+            state_for_coupler=nxt,
+            mech_for_coupler=mech_state,
+        )
+        r_c = (cbar - prev["c"]) / dt - rhs_c
+        pde_c = self._masked_mean_abs(r_c)
+
+        heta = smooth_heaviside(eta)
+        heta_d = smooth_heaviside_prime(eta)
+        if self.cfg.twinning.scale_twin_gradient_by_hphi:
+            grad_coef_eta = self.cfg.twinning.kappa_eta * hphi
+        else:
+            grad_coef_eta = torch.full_like(hphi, float(self.cfg.twinning.kappa_eta))
+        twin_dw = hphi * 2.0 * self.cfg.twinning.W_barrier_MPa * eta * (1.0 - eta) * (1.0 - 2.0 * eta)
+        tau_tw = self._resolved_twin_shear(mech_state["sigma_xx"], mech_state["sigma_yy"], mech_state["sigma_xy"])
+        tw_drive = hphi * tau_tw * self.cfg.twinning.gamma_twin * heta_d
+        r2 = (self.grid.x_um - self.cfg.domain.notch_tip_x_um) ** 2 + (self.grid.y_um - self.cfg.domain.notch_center_y_um) ** 2
+        nuc = torch.exp(-r2 / max(self.cfg.twinning.nucleation_center_radius_um ** 2, 1e-12))
+        act = torch.relu(torch.abs(tau_tw) - self.cfg.twinning.twin_crss_MPa)
+        langevin = hphi * self.cfg.twinning.langevin_nucleation_noise * nuc * act
+        eta_source = twin_dw - tw_drive - langevin
+        gx_eta, gy_eta = grad_xy(
+            eta,
+            self.dx_um,
+            self.dy_um,
+            x_coords=self.x_coords_um,
+            y_coords=self.y_coords_um,
+        )
+        grad_term = divergence(
+            grad_coef_eta * gx_eta,
+            grad_coef_eta * gy_eta,
+            self.dx_um,
+            self.dy_um,
+            x_coords=self.x_coords_um,
+            y_coords=self.y_coords_um,
+        )
+        r_eta = (eta - prev["eta"]) / dt + self.cfg.twinning.L_eta * (eta_source - grad_term)
+        solid = solid_indicator(phi, self.cfg.domain.solid_phase_threshold)
+        pde_eta = self._masked_mean_abs(r_eta, solid)
+
+        pde_mech = self._compute_mechanics_residual(mech_state, phi)
+        return {
+            "pde_phi": float(pde_phi),
+            "pde_c": float(pde_c),
+            "pde_eta": float(pde_eta),
+            "pde_mech": float(pde_mech),
+        }
+
+    def _estimate_surrogate_uncertainty(self, prev: Dict[str, torch.Tensor]) -> float:
+        """通过输入微扰多次推理估计 surrogate 局部不确定性。"""
+        if self.surrogate is None or (not bool(self.cfg.ml.enable_uncertainty_gate)):
+            return 0.0
+        n = max(2, int(self.cfg.ml.uncertainty_samples))
+        std = max(float(self.cfg.ml.uncertainty_jitter_std), 0.0)
+        if std <= 0.0:
+            return 0.0
+        vals: List[float] = []
+        cspan = max(self.cfg.corrosion.cMg_max - self.cfg.corrosion.cMg_min, 1e-12)
+        for _ in range(n):
+            pert: Dict[str, torch.Tensor] = {}
+            for k, v in prev.items():
+                noise = torch.randn_like(v) * std
+                vv = v + noise
+                if k == "phi":
+                    vv = torch.clamp(vv, 0.0, 1.0)
+                elif k == "c":
+                    vv = torch.clamp(vv, self.cfg.corrosion.cMg_min, self.cfg.corrosion.cMg_max)
+                elif k == "eta":
+                    vv = torch.clamp(vv, 0.0, 1.0)
+                elif k == "epspeq":
+                    vv = torch.clamp(vv, 0.0, 1e6)
+                pert[k] = vv
+            pred = self.surrogate.predict(pert)
+            dphi = self._masked_mean_abs(pred["phi"] - prev["phi"])
+            dc = self._masked_mean_abs(pred["c"] - prev["c"]) / cspan
+            deta = self._masked_mean_abs(pred["eta"] - prev["eta"])
+            vals.append(dphi + dc + deta)
+        vt = torch.tensor(vals, device=self.device, dtype=self.dtype)
+        return float(torch.std(vt, unbiased=False).item())
+
+    def _on_surrogate_accept(self) -> None:
+        """更新 surrogate 接受后的自适应 rollout 状态。"""
+        self._rollout_reject_streak = 0
+        self._rollout_success_streak += 1
+        if not bool(self.cfg.ml.adaptive_rollout):
+            return
+        need = max(1, int(self.cfg.ml.rollout_success_streak_to_increase))
+        if self._rollout_success_streak < need:
+            return
+        rmax = max(1, int(self.cfg.ml.rollout_max_every))
+        if self._current_rollout_every < rmax:
+            self._current_rollout_every += 1
+            self.stats["ml_rollout_increase"] += 1
+        self._rollout_success_streak = 0
+
+    def _on_surrogate_reject(self) -> None:
+        """更新 surrogate 拒绝后的自适应 rollout 状态。"""
+        self._rollout_success_streak = 0
+        self._rollout_reject_streak += 1
+        if not bool(self.cfg.ml.adaptive_rollout):
+            return
+        need = max(1, int(self.cfg.ml.rollout_reject_streak_to_decrease))
+        if self._rollout_reject_streak < need:
+            return
+        rmin = max(1, int(self.cfg.ml.rollout_min_every))
+        if self._current_rollout_every > rmin:
+            self._current_rollout_every -= 1
+            self.stats["ml_rollout_decrease"] += 1
+        self._rollout_reject_streak = 0
+
+    def _estimate_diffusion_dt_limit(self) -> float:
+        """估计显式扩散稳定步长上限。"""
+        dmax = max(float(self.cfg.corrosion.D_l_m2_s), float(self.cfg.corrosion.D_s_m2_s), 1e-20)
+        dx = max(float(self.dx_m), 1e-20)
+        dy = max(float(self.dy_m), 1e-20)
+        return 1.0 / (2.0 * dmax * ((1.0 / (dx * dx)) + (1.0 / (dy * dy))))
+
+    def _diffusion_substeps(self, dt_s: float) -> int:
+        """根据稳定性约束估计扩散子步数。"""
+        if not self.cfg.numerics.diffusion_auto_substeps:
+            return 1
+        safety = max(min(float(self.cfg.numerics.diffusion_dt_safety), 1.0), 1e-6)
+        dt_safe = max(self.diffusion_dt_limit_s * safety, 1e-16)
+        n = int(math.ceil(dt_s / dt_safe))
+        return max(1, min(n, int(max(self.cfg.numerics.diffusion_substeps_cap, 1))))
+
+    def _diffusion_stage_dts(self, dt_s: float) -> List[float]:
+        """为扩散方程生成子步时间序列（普通子循环或 STS）。"""
+        key = round(float(dt_s), 15)
+        cached = self._diffusion_stage_cache.get(key)
+        if cached is not None:
+            return cached
+
+        mode = str(self.cfg.numerics.diffusion_integrator).strip().lower()
+        if mode != "sts":
+            n_sub = self._diffusion_substeps(dt_s)
+            out = [float(dt_s) / float(n_sub)] * n_sub
+            self._diffusion_stage_cache[key] = out
+            return out
+
+        safety = max(min(float(self.cfg.numerics.diffusion_dt_safety), 1.0), 1e-6)
+        dt_fe = max(self.diffusion_dt_limit_s * safety, 1e-16)
+        if dt_s <= dt_fe:
+            out = [float(dt_s)]
+            self._diffusion_stage_cache[key] = out
+            return out
+
+        nu = min(max(float(self.cfg.numerics.diffusion_sts_nu), 1e-4), 0.5)
+        m_max = max(2, int(self.cfg.numerics.diffusion_sts_max_stages))
+        best: List[float] | None = None
+        for m in range(2, m_max + 1):
+            raw: List[float] = []
+            total = 0.0
+            for j in range(1, m + 1):
+                theta = (2.0 * j - 1.0) * math.pi / (2.0 * m)
+                denom = (1.0 + nu) + (nu - 1.0) * math.cos(theta)
+                denom = max(denom, 1e-9)
+                dt_j = dt_fe / denom
+                raw.append(dt_j)
+                total += dt_j
+            if total >= dt_s:
+                scale = float(dt_s) / max(total, 1e-16)
+                best = [scale * v for v in raw]
+                break
+
+        if best is None:
+            # Fallback to classic subcycling when requested super-step exceeds configured stage cap.
+            n_sub = self._diffusion_substeps(dt_s)
+            best = [float(dt_s) / float(n_sub)] * n_sub
+
+        self._diffusion_stage_cache[key] = best
+        return best
+
+    def _diffusion_rhs(
+        self,
+        c_field: torch.Tensor,
+        D: torch.Tensor,
+        corr: torch.Tensor,
+        gx_phi: torch.Tensor,
+        gy_phi: torch.Tensor,
+        phi_for_state: torch.Tensor,
+        state_for_coupler: Dict[str, torch.Tensor] | None = None,
+        mech_for_coupler: Dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """扩散方程右端项。"""
+        gx_c, gy_c = grad_xy(c_field, self.dx_m, self.dy_m, x_coords=self.x_coords_m, y_coords=self.y_coords_m)
+        jx = -D * (gx_c + corr * gx_phi)
+        jy = -D * (gy_c + corr * gy_phi)
+        if self.couplers:
+            state_tmp = dict(self.state if state_for_coupler is None else state_for_coupler)
+            state_tmp["phi"] = phi_for_state
+            state_tmp["c"] = c_field
+            aux = self.last_mech if mech_for_coupler is None else mech_for_coupler
+            for cp in self.couplers:
+                ex, ey = cp.concentration_drift_flux(state_tmp, aux)
+                jx = jx + ex
+                jy = jy + ey
+        rhs = -divergence(
+            jx,
+            jy,
+            self.dx_m,
+            self.dy_m,
+            x_coords=self.x_coords_m,
+            y_coords=self.y_coords_m,
+        )
+        return torch.nan_to_num(rhs, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _pcg_scalar(
+        self,
+        apply_A,
+        rhs: torch.Tensor,
+        *,
+        x0: torch.Tensor | None = None,
+        diag_inv: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """通用标量场 PCG 迭代器（矩阵自由）。"""
+        if x0 is None:
+            x = rhs.clone()
+        else:
+            x = x0.clone()
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        rhs = torch.nan_to_num(rhs, nan=0.0, posinf=0.0, neginf=0.0)
+        r = rhs - apply_A(x)
+        z = r if diag_inv is None else diag_inv * r
+        p = z.clone()
+        rz_old = torch.sum(r * z)
+        r0 = torch.sqrt(torch.clamp(torch.sum(r * r), min=0.0))
+        abs_tol = max(float(self.cfg.numerics.imex_solver_tol_abs), 0.0)
+        rel_tol = max(float(self.cfg.numerics.imex_solver_tol_rel), 0.0)
+        tol = max(abs_tol, rel_tol * float(r0.item()))
+        relax = max(min(float(self.cfg.numerics.imex_relaxation), 1.0), 0.1)
+        if float(r0.item()) <= tol:
+            return x
+
+        n_iter = max(1, int(self.cfg.numerics.imex_solver_iters))
+        for _ in range(n_iter):
+            Ap = apply_A(p)
+            denom = torch.sum(p * Ap)
+            if torch.abs(denom).item() <= 1e-30:
+                break
+            alpha = rz_old / denom
+            x = x + relax * alpha * p
+            r = r - relax * alpha * Ap
+            r_norm = torch.sqrt(torch.clamp(torch.sum(r * r), min=0.0))
+            if float(r_norm.item()) <= tol:
+                break
+            z = r if diag_inv is None else diag_inv * r
+            rz_new = torch.sum(r * z)
+            if torch.abs(rz_old).item() <= 1e-30:
+                break
+            beta = rz_new / rz_old
+            p = z + beta * p
+            rz_old = rz_new
+
+        return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _solve_helmholtz_imex(
+        self,
+        rhs: torch.Tensor,
+        *,
+        alpha: float,
+        dx: float,
+        dy: float,
+        x_coords: torch.Tensor | None,
+        y_coords: torch.Tensor | None,
+        x0: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """求解 `(I - alpha*Lap)u = rhs`。"""
+        a = max(float(alpha), 0.0)
+        if a <= 0.0:
+            return rhs
+
+        inv_diag = 1.0 / (1.0 + a * (2.0 / max(dx * dx, 1e-20) + 2.0 / max(dy * dy, 1e-20)))
+        diag_inv = torch.full_like(rhs, fill_value=float(inv_diag))
+
+        def apply_A(u: torch.Tensor) -> torch.Tensor:
+            return u - a * laplacian(
+                u,
+                dx,
+                dy,
+                x_coords=x_coords,
+                y_coords=y_coords,
+            )
+
+        return self._pcg_scalar(apply_A, rhs, x0=x0, diag_inv=diag_inv)
+
+    def _solve_variable_diffusion_imex(
+        self,
+        rhs: torch.Tensor,
+        *,
+        coeff: float,
+        diff_coef: torch.Tensor,
+        dx: float,
+        dy: float,
+        x_coords: torch.Tensor | None,
+        y_coords: torch.Tensor | None,
+        x0: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """求解 `(I - coeff*div(diff_coef*grad))u = rhs`。"""
+        c = max(float(coeff), 0.0)
+        if c <= 0.0:
+            return rhs
+        diag_lap = 2.0 / max(dx * dx, 1e-20) + 2.0 / max(dy * dy, 1e-20)
+        diag_inv = 1.0 / (1.0 + c * torch.clamp(diff_coef, min=0.0) * diag_lap)
+        diag_inv = torch.clamp(torch.nan_to_num(diag_inv, nan=1.0, posinf=1.0, neginf=1.0), min=1e-8, max=1e8)
+
+        def apply_A(u: torch.Tensor) -> torch.Tensor:
+            gux, guy = grad_xy(u, dx, dy, x_coords=x_coords, y_coords=y_coords)
+            diff_flux_x = diff_coef * gux
+            diff_flux_y = diff_coef * guy
+            return u - c * divergence(
+                diff_flux_x,
+                diff_flux_y,
+                dx,
+                dy,
+                x_coords=x_coords,
+                y_coords=y_coords,
+            )
+
+        return self._pcg_scalar(apply_A, rhs, x0=x0, diag_inv=diag_inv)
+
+    def _pick_device(self, mode: str) -> torch.device:
+        """解析设备选择策略。"""
+        if mode == "cpu":
+            return torch.device("cpu")
+        if mode == "cuda":
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def _omega_kappa_phi(self) -> tuple[float, float]:
+        """由界面能和厚度换算相场参数 omega 与 kappa。"""
+        gamma = self.cfg.corrosion.gamma_J_m2
+        ell_m = self.cfg.corrosion.interface_thickness_um * 1e-6
+        omega = 3.0 * gamma / (4.0 * ell_m) / 1e6  # MPa
+        kappa = 1.5 * gamma * ell_m / 1e6  # MPa*m^2
+        return omega, kappa
+
+    def _material_overrides(self) -> Dict[str, torch.Tensor]:
+        """汇总扩展耦合器对材料参数的覆盖项。"""
+        out: Dict[str, torch.Tensor] = {}
+        for c in self.couplers:
+            upd = c.update_material_overrides(self.state, self.last_mech)
+            for k, v in upd.items():
+                out[k] = v if k not in out else out[k] * v
+        return out
+
+    def _corrosion_mobility(
+        self,
+        state: Dict[str, torch.Tensor] | None = None,
+        mech: Dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """计算腐蚀迁移率（含力学与扩展耦合影响）。"""
+        st = self.state if state is None else state
+        mech_state = self.last_mech if mech is None else mech
+        c = self.cfg.corrosion
+        sigma_h_pa = mech_state["sigma_h"] * 1e6
+        mech_fac = (st["epspeq"] / max(c.yield_strain_for_mech, 1e-12) + 1.0) * torch.exp(
+            torch.clamp(sigma_h_pa * c.molar_volume_m3_mol / (c.gas_constant_J_mol_K * c.temperature_K), -12.0, 12.0)
+        )
+        out = c.L0 * self.pitting_field * mech_fac
+        for cp in self.couplers:
+            out = out * cp.corrosion_mobility_multiplier(st, mech_state)
+        return out
+
+    def _resolved_twin_shear(self, sigma_xx: torch.Tensor, sigma_yy: torch.Tensor, sigma_xy: torch.Tensor) -> torch.Tensor:
+        """计算孪晶系分解剪应力。"""
+        tau = self.twin_sx * (sigma_xx * self.twin_nx + sigma_xy * self.twin_ny) + self.twin_sy * (
+            sigma_xy * self.twin_nx + sigma_yy * self.twin_ny
+        )
+        return tau
+
+    def _sanitize_state(self) -> None:
+        """对状态做数值清洗与物理约束裁剪。"""
+        cmin = self.cfg.corrosion.cMg_min
+        cmax = self.cfg.corrosion.cMg_max
+        self.state["phi"] = torch.clamp(torch.nan_to_num(self.state["phi"], nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+        solid = solid_indicator(self.state["phi"], self.cfg.domain.solid_phase_threshold)
+        self.state["c"] = torch.clamp(torch.nan_to_num(self.state["c"], nan=cmin, posinf=cmax, neginf=cmin), cmin, cmax)
+        self.state["eta"] = torch.clamp(torch.nan_to_num(self.state["eta"], nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+        self.state["eta"] = self.state["eta"] * solid
+        self.state["epspeq"] = torch.clamp(
+            torch.nan_to_num(self.state["epspeq"], nan=0.0, posinf=1e6, neginf=0.0),
+            0.0,
+            1e6,
+        )
+        self.state["epspeq"] = self.state["epspeq"] * solid
+        self.last_mech = {k: torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0) for k, v in self.last_mech.items()}
+        for k in ("sigma_xx", "sigma_yy", "sigma_xy", "sigma_h"):
+            self.last_mech[k] = self.last_mech[k] * solid
+
+    def _surrogate_update_is_valid(self, prev: Dict[str, torch.Tensor], nxt: Dict[str, torch.Tensor]) -> bool:
+        """判断 surrogate 提议步是否通过门控。"""
+        def reject(reason: str) -> bool:
+            key = f"ml_reject_{reason}"
+            self.stats[key] = self.stats.get(key, 0) + 1
+            return False
+
+        self._last_gate_metrics["pde_phi"] = 0.0
+        self._last_gate_metrics["pde_c"] = 0.0
+        self._last_gate_metrics["pde_eta"] = 0.0
+        self._last_gate_metrics["pde_mech"] = 0.0
+        self._last_gate_metrics["uncertainty"] = 0.0
+
+        max_phi_drop = self.cfg.ml.max_mean_phi_drop
+        if max_phi_drop > 0.0:
+            phi_drop = float(self._mean_field(prev["phi"] - nxt["phi"]).item())
+            if phi_drop > max_phi_drop:
+                return reject("phi_drop")
+        max_eta_rise = self.cfg.ml.max_mean_eta_rise
+        if max_eta_rise > 0.0:
+            eta_rise = float(self._mean_field(nxt["eta"] - prev["eta"]).item())
+            if eta_rise > max_eta_rise:
+                return reject("eta_rise")
+        phi_abs_delta = self.cfg.ml.max_mean_phi_abs_delta
+        if phi_abs_delta > 0.0:
+            if abs(float(self._mean_field(nxt["phi"] - prev["phi"]).item())) > phi_abs_delta:
+                return reject("phi_mean_delta")
+        eta_abs_delta = self.cfg.ml.max_mean_eta_abs_delta
+        if eta_abs_delta > 0.0:
+            if abs(float(self._mean_field(nxt["eta"] - prev["eta"]).item())) > eta_abs_delta:
+                return reject("eta_mean_delta")
+        c_abs_delta = self.cfg.ml.max_mean_c_abs_delta
+        if c_abs_delta > 0.0:
+            if abs(float(self._mean_field(nxt["c"] - prev["c"]).item())) > c_abs_delta:
+                return reject("c_mean_delta")
+        eps_abs_delta = self.cfg.ml.max_mean_epspeq_abs_delta
+        if eps_abs_delta > 0.0:
+            if abs(float(self._mean_field(nxt["epspeq"] - prev["epspeq"]).item())) > eps_abs_delta:
+                return reject("eps_mean_delta")
+
+        if self.cfg.ml.max_field_delta > 0.0:
+            gate = self.cfg.ml.max_field_delta
+            tol = 1e-6
+            if torch.max(torch.abs(nxt["phi"] - prev["phi"])).item() > gate + tol:
+                return reject("phi_field_delta")
+            if torch.max(torch.abs(nxt["eta"] - prev["eta"])).item() > gate + tol:
+                return reject("eta_field_delta")
+            if torch.max(torch.abs(nxt["c"] - prev["c"])).item() > gate * 1.5 + tol:
+                return reject("c_field_delta")
+        dphi = float(self._mean_field(torch.abs(nxt["phi"] - prev["phi"])).item())
+        cspan = max(self.cfg.corrosion.cMg_max - self.cfg.corrosion.cMg_min, 1e-12)
+        dc = float(self._mean_field(torch.abs(nxt["c"] - prev["c"])).item()) / cspan
+        deta = float(self._mean_field(torch.abs(nxt["eta"] - prev["eta"])).item())
+        solid_nxt = solid_indicator(nxt["phi"], self.cfg.domain.solid_phase_threshold)
+        liquid = 1.0 - solid_nxt
+        liquid_eta = float(self._mean_field(torch.abs(nxt["eta"] * liquid)).item())
+        if liquid_eta > max(self.cfg.ml.max_mean_eta_abs_delta, 1e-6):
+            return reject("liquid_eta")
+        liquid_eps = float(self._mean_field(torch.abs(nxt["epspeq"] * liquid)).item())
+        if liquid_eps > max(self.cfg.ml.max_mean_epspeq_abs_delta, 1e-6):
+            return reject("liquid_eps")
+        rel = dphi + dc + deta
+        if rel > self.cfg.ml.residual_gate:
+            return reject("residual_gate")
+
+        if bool(self.cfg.ml.enable_uncertainty_gate):
+            unc = self._estimate_surrogate_uncertainty(prev)
+            self._last_gate_metrics["uncertainty"] = float(unc)
+            if unc > max(float(self.cfg.ml.uncertainty_gate), 0.0):
+                return reject("uncertainty")
+
+        mech_prev = self._estimate_state_mechanics(prev)
+        mech_nxt = self._estimate_state_mechanics(nxt)
+
+        if bool(self.cfg.ml.enable_pde_residual_gate):
+            residuals = self._compute_pde_residuals(prev, nxt, mech_nxt, self.cfg.numerics.dt_s)
+            self._last_gate_metrics["pde_phi"] = residuals["pde_phi"]
+            self._last_gate_metrics["pde_c"] = residuals["pde_c"]
+            self._last_gate_metrics["pde_eta"] = residuals["pde_eta"]
+            self._last_gate_metrics["pde_mech"] = residuals["pde_mech"]
+            if (
+                self.cfg.ml.pde_residual_phi_abs_max > 0.0
+                and residuals["pde_phi"] > float(self.cfg.ml.pde_residual_phi_abs_max)
+            ):
+                return reject("pde_phi")
+            if (
+                self.cfg.ml.pde_residual_c_abs_max > 0.0
+                and residuals["pde_c"] > float(self.cfg.ml.pde_residual_c_abs_max)
+            ):
+                return reject("pde_c")
+            if (
+                self.cfg.ml.pde_residual_eta_abs_max > 0.0
+                and residuals["pde_eta"] > float(self.cfg.ml.pde_residual_eta_abs_max)
+            ):
+                return reject("pde_eta")
+            if (
+                self.cfg.ml.pde_residual_mech_abs_max > 0.0
+                and residuals["pde_mech"] > float(self.cfg.ml.pde_residual_mech_abs_max)
+            ):
+                return reject("pde_mech")
+
+        if bool(self.cfg.ml.enable_energy_gate):
+            e_prev = self._compute_free_energy(prev, mech_prev)
+            e_nxt = self._compute_free_energy(nxt, mech_nxt)
+            self._last_gate_metrics["free_energy"] = float(e_nxt)
+            dE = float(e_nxt - e_prev)
+            dE_abs_max = max(float(self.cfg.ml.energy_abs_increase_max), 0.0)
+            dE_rel_max = max(float(self.cfg.ml.energy_rel_increase_max), 0.0)
+            dE_allow = dE_abs_max + dE_rel_max * max(abs(e_prev), 1.0)
+            if dE > dE_allow:
+                return reject("energy")
+        else:
+            self._last_gate_metrics["free_energy"] = float(self._compute_free_energy(nxt, mech_nxt))
+        return True
+
+    def _limit_surrogate_update(self, prev: Dict[str, torch.Tensor], nxt: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """限制 surrogate 增量幅度，抑制单步跃迁。"""
+        gate = max(self.cfg.ml.max_field_delta, 1e-6)
+        relax = max(min(float(self.cfg.ml.surrogate_delta_scale), 1.0), 0.0)
+        out = {k: v.clone() for k, v in prev.items()}
+
+        def limit_field(name: str, scale: float) -> None:
+            d_raw = (nxt[name] - prev[name]) * relax
+            d = torch.clamp(d_raw, min=-gate * scale, max=gate * scale)
+            out[name] = prev[name] + d
+
+        limit_field("phi", 1.0)
+        limit_field("eta", 1.0)
+        limit_field("c", 1.5)
+        if self.cfg.ml.surrogate_update_mechanics_fields:
+            limit_field("ux", 0.5)
+            limit_field("uy", 0.5)
+            limit_field("epspeq", 0.2)
+        else:
+            out["ux"] = prev["ux"]
+            out["uy"] = prev["uy"]
+            out["epspeq"] = prev["epspeq"]
+        out["phi"] = torch.clamp(out["phi"], 0.0, 1.0)
+        out["c"] = torch.clamp(out["c"], self.cfg.corrosion.cMg_min, self.cfg.corrosion.cMg_max)
+        out["eta"] = torch.clamp(out["eta"], 0.0, 1.0)
+        out["epspeq"] = torch.clamp(out["epspeq"], 0.0, 1e6)
+        return out
+
+    def _physics_step(self, dt_s: float, step_idx: int) -> None:
+        """执行纯物理时间步推进。"""
+        # 1) 力学 + 晶体塑性（可多速率更新）
+        mech_every = max(1, int(self.cfg.numerics.mechanics_update_every))
+        # 仅在指定频率点更新力学，可在稳定阶段降低力学开销。
+        do_mech_update = step_idx <= 1 or (step_idx % mech_every == 0)
+        if do_mech_update:
+            if bool(self.cfg.numerics.mechanics_use_ml_initial_guess) and self.surrogate is not None:
+                # 可选：用 surrogate 位移场作为力学迭代初值（仅作初值，不替代物理求解）。
+                guess = self.surrogate.predict(self.state)
+                self.state["ux"] = torch.nan_to_num(guess["ux"], nan=0.0, posinf=0.0, neginf=0.0)
+                self.state["uy"] = torch.nan_to_num(guess["uy"], nan=0.0, posinf=0.0, neginf=0.0)
+                self.stats["mech_ml_initial_guess_used"] += 1
+            # 1.1 预测力学平衡：基于当前位移/本征应变求解应力。
+            mech_predict = self.mech.solve_quasi_static(
+                self.state,
+                self.epsp,
+                self.dx_um,
+                self.dy_um,
+                x_coords_um=self.x_coords_um,
+                y_coords_um=self.y_coords_um,
+            )
+            cg_attempted = bool(float(mech_predict.get("mech_cg_attempted", torch.tensor(0.0)).item()) > 0.5)
+            if cg_attempted:
+                cg_ok = bool(float(mech_predict.get("mech_cg_converged", torch.tensor(0.0)).item()) > 0.5)
+                cg_it = int(round(float(mech_predict.get("mech_cg_iters", torch.tensor(0.0)).item())))
+                if cg_ok:
+                    self.stats["mech_cg_converged"] += 1
+                else:
+                    self.stats["mech_cg_failed"] += 1
+                self.stats["mech_cg_iters_sum"] += max(cg_it, 0)
+            self.stats["mech_predict_solve"] += 1
+            self.last_mech = mech_predict
+            # 1.2 用预测应力驱动晶体塑性更新（滑移、硬化、等效塑性应变）。
+            cp_out = self.cp.update(
+                cp_state=self.cp_state,
+                sigma_xx=self.last_mech["sigma_xx"],
+                sigma_yy=self.last_mech["sigma_yy"],
+                sigma_xy=self.last_mech["sigma_xy"],
+                eta=self.state["eta"],
+                dt_s=dt_s,
+                material_overrides=self._material_overrides(),
+            )
+            self.cp_state["g"] = cp_out["g"]
+            self.cp_state["gamma_accum"] = cp_out["gamma_accum"]
+            # 1.3 将“应变率”积分到“应变增量”（显式欧拉）。
+            self.epsp["exx"] = self.epsp["exx"] + dt_s * cp_out["epsp_dot_xx"]
+            self.epsp["eyy"] = self.epsp["eyy"] + dt_s * cp_out["epsp_dot_yy"]
+            self.epsp["exy"] = self.epsp["exy"] + dt_s * cp_out["epsp_dot_xy"]
+            self.state["epspeq"] = self.state["epspeq"] + dt_s * cp_out["epspeq_dot"]
+            self.epsp["exx"] = torch.clamp(torch.nan_to_num(self.epsp["exx"], nan=0.0, posinf=0.0, neginf=0.0), min=-1.0, max=1.0)
+            self.epsp["eyy"] = torch.clamp(torch.nan_to_num(self.epsp["eyy"], nan=0.0, posinf=0.0, neginf=0.0), min=-1.0, max=1.0)
+            self.epsp["exy"] = torch.clamp(torch.nan_to_num(self.epsp["exy"], nan=0.0, posinf=0.0, neginf=0.0), min=-1.0, max=1.0)
+            self.state["epspeq"] = torch.clamp(
+                torch.nan_to_num(self.state["epspeq"], nan=0.0, posinf=1e6, neginf=0.0),
+                min=0.0,
+                max=1e6,
+            )
+
+            if bool(cp_out.get("plastic_active", True)):
+                # 1.4 若塑性激活，执行力学校正步，减小“先塑性后应力”的不一致。
+                self.last_mech = self.mech.solve_quasi_static(
+                    self.state,
+                    self.epsp,
+                    self.dx_um,
+                    self.dy_um,
+                    x_coords_um=self.x_coords_um,
+                    y_coords_um=self.y_coords_um,
+                )
+                cg_attempted = bool(float(self.last_mech.get("mech_cg_attempted", torch.tensor(0.0)).item()) > 0.5)
+                if cg_attempted:
+                    cg_ok = bool(float(self.last_mech.get("mech_cg_converged", torch.tensor(0.0)).item()) > 0.5)
+                    cg_it = int(round(float(self.last_mech.get("mech_cg_iters", torch.tensor(0.0)).item())))
+                    if cg_ok:
+                        self.stats["mech_cg_converged"] += 1
+                    else:
+                        self.stats["mech_cg_failed"] += 1
+                    self.stats["mech_cg_iters_sum"] += max(cg_it, 0)
+                self.stats["mech_correct_solve"] += 1
+            else:
+                # 若本步纯弹性，直接复用预测力学结果。
+                self.last_mech = mech_predict
+                self.stats["mech_correct_skipped_elastic"] += 1
+
+        # 2) 腐蚀 + 扩散 + 孪晶演化
+        phi = self.state["phi"]
+        cbar = self.state["c"]
+        eta = self.state["eta"]
+        hphi = smooth_heaviside(phi)
+        hphi_d = smooth_heaviside_prime(phi)
+
+        cl_eq = self.cfg.corrosion.c_l_eq_norm
+        cs_eq = self.cfg.corrosion.c_s_eq_norm
+        delta_eq = cs_eq - cl_eq
+
+        omega, kappa_phi = self._omega_kappa_phi()
+        # 相场驱动力中的非线性部分：化学势差项 + 双稳势项。
+        chem_drive = -self.cfg.corrosion.A_J_m3 / 1e6 * (cbar - hphi * delta_eq - cl_eq) * delta_eq * hphi_d
+        phi_nonlin = chem_drive + omega * double_well_prime(phi)
+
+        if self.cfg.corrosion.include_mech_term_in_phi_variation:
+            # Optional "full variational" route.
+            e_mech = 0.5 * (
+                self.last_mech["sigma_xx"] * self.last_mech["sigma_xx"]
+                + self.last_mech["sigma_yy"] * self.last_mech["sigma_yy"]
+                + 2.0 * self.last_mech["sigma_xy"] * self.last_mech["sigma_xy"]
+            ) / max(self.cfg.mechanics.mu_GPa * 1e3, 1e-9)
+            phi_nonlin = phi_nonlin - hphi_d * e_mech
+
+        if self.cfg.corrosion.include_twin_grad_term_in_phi_variation and self.cfg.twinning.scale_twin_gradient_by_hphi:
+            gx_eta_m, gy_eta_m = grad_xy(
+                eta,
+                self.dx_m,
+                self.dy_m,
+                x_coords=self.x_coords_m,
+                y_coords=self.y_coords_m,
+            )
+            twin_grad_e = 0.5 * self.cfg.twinning.kappa_eta * (gx_eta_m * gx_eta_m + gy_eta_m * gy_eta_m)
+            phi_nonlin = phi_nonlin - hphi_d * twin_grad_e
+
+        L_phi = self._corrosion_mobility()
+        phi_nonlin = torch.nan_to_num(phi_nonlin, nan=0.0, posinf=0.0, neginf=0.0)
+        phi_mode = str(self.cfg.numerics.phi_integrator).strip().lower()
+        if phi_mode.startswith("imex"):
+            # IMEX: 非线性显式，界面曲率项隐式（Helmholtz）。
+            rhs_phi = phi - dt_s * L_phi * phi_nonlin
+            alpha_phi = dt_s * kappa_phi * max(float(self._mean_field(L_phi).item()), 0.0)
+            phi_new = self._solve_helmholtz_imex(
+                rhs_phi,
+                alpha=alpha_phi,
+                dx=self.dx_m,
+                dy=self.dy_m,
+                x_coords=self.x_coords_m,
+                y_coords=self.y_coords_m,
+                x0=phi,
+            )
+        else:
+            phi_rhs = phi_nonlin - kappa_phi * laplacian(
+                phi,
+                self.dx_m,
+                self.dy_m,
+                x_coords=self.x_coords_m,
+                y_coords=self.y_coords_m,
+            )
+            phi_rhs = torch.nan_to_num(phi_rhs, nan=0.0, posinf=0.0, neginf=0.0)
+            # 显式更新 phi（旧路径保留，便于 A/B 对照）。
+            phi_new = phi - dt_s * L_phi * phi_rhs
+        phi_new = torch.clamp(phi_new, 0.0, 1.0)
+        phi_new = torch.nan_to_num(phi_new, nan=0.0, posinf=1.0, neginf=0.0)
+
+        # 扩散方程（Kovacevic 形式），支持可配置积分策略。
+        phi_c = phi_new
+        hphi_c = smooth_heaviside(phi_c)
+        hphi_d_c = smooth_heaviside_prime(phi_c)
+        D = self.cfg.corrosion.D_s_m2_s * hphi_c + (1.0 - hphi_c) * self.cfg.corrosion.D_l_m2_s
+        # 耦合修正项：由相场梯度导致的平衡浓度梯度贡献。
+        gx_phi, gy_phi = grad_xy(phi_c, self.dx_m, self.dy_m, x_coords=self.x_coords_m, y_coords=self.y_coords_m)
+        corr = hphi_d_c * (cl_eq - cs_eq)
+        stage_dts = self._diffusion_stage_dts(dt_s)
+        c_tmp = cbar
+        for dt_stage in stage_dts:
+            # STS / 子循环阶段推进：每个子阶段都做裁剪与 NaN 防护。
+            rhs_c = self._diffusion_rhs(c_tmp, D, corr, gx_phi, gy_phi, phi_c)
+            c_tmp = torch.clamp(
+                c_tmp + float(dt_stage) * rhs_c,
+                min=self.cfg.corrosion.cMg_min,
+                max=self.cfg.corrosion.cMg_max,
+            )
+            c_tmp = torch.nan_to_num(
+                c_tmp,
+                nan=cl_eq,
+                posinf=self.cfg.corrosion.cMg_max,
+                neginf=self.cfg.corrosion.cMg_min,
+            )
+        c_new = c_tmp
+
+        # 孪晶 TDGL 方程推进。
+        heta = smooth_heaviside(eta)
+        heta_d = smooth_heaviside_prime(eta)
+        k_eta = self.cfg.twinning.kappa_eta
+        grad_coef_eta = k_eta * hphi
+        w_t = self.cfg.twinning.W_barrier_MPa
+        twin_dw = hphi * 2.0 * w_t * eta * (1.0 - eta) * (1.0 - 2.0 * eta)
+        tau_tw = self._resolved_twin_shear(self.last_mech["sigma_xx"], self.last_mech["sigma_yy"], self.last_mech["sigma_xy"])
+        # 正向驱动：分解剪应力 * 孪晶剪切量 * 势函数导数。
+        tw_drive = hphi * tau_tw * self.cfg.twinning.gamma_twin * heta_d
+
+        # 在缺口附近且分解剪应力超过阈值时引入成核扰动。
+        r2 = (self.grid.x_um - self.cfg.domain.notch_tip_x_um) ** 2 + (self.grid.y_um - self.cfg.domain.notch_center_y_um) ** 2
+        nuc = torch.exp(-r2 / max(self.cfg.twinning.nucleation_center_radius_um ** 2, 1e-12))
+        act = torch.relu(torch.abs(tau_tw) - self.cfg.twinning.twin_crss_MPa)
+        langevin = hphi * self.cfg.twinning.langevin_nucleation_noise * nuc * act
+
+        eta_source = twin_dw - tw_drive - langevin
+        eta_source = torch.nan_to_num(eta_source, nan=0.0, posinf=0.0, neginf=0.0)
+        eta_mode = str(self.cfg.numerics.eta_integrator).strip().lower()
+        if eta_mode.startswith("imex"):
+            # IMEX: 梯度正则项隐式，驱动项显式。
+            rhs_eta = eta - dt_s * self.cfg.twinning.L_eta * eta_source
+            eta_new = self._solve_variable_diffusion_imex(
+                rhs_eta,
+                coeff=dt_s * self.cfg.twinning.L_eta,
+                diff_coef=grad_coef_eta,
+                dx=self.dx_um,
+                dy=self.dy_um,
+                x_coords=self.x_coords_um,
+                y_coords=self.y_coords_um,
+                x0=eta,
+            )
+        else:
+            gx_eta, gy_eta = grad_xy(eta, self.dx_um, self.dy_um, x_coords=self.x_coords_um, y_coords=self.y_coords_um)
+            grad_term = divergence(
+                grad_coef_eta * gx_eta,
+                grad_coef_eta * gy_eta,
+                self.dx_um,
+                self.dy_um,
+                x_coords=self.x_coords_um,
+                y_coords=self.y_coords_um,
+            )
+            eta_rhs = eta_source - grad_term
+            eta_rhs = torch.nan_to_num(eta_rhs, nan=0.0, posinf=0.0, neginf=0.0)
+            eta_new = eta - dt_s * self.cfg.twinning.L_eta * eta_rhs
+        eta_new = torch.clamp(eta_new, 0.0, 1.0)
+        eta_new = torch.nan_to_num(eta_new, nan=0.0, posinf=1.0, neginf=0.0)
+        eta_new = eta_new * solid_indicator(phi_new, self.cfg.domain.solid_phase_threshold)
+
+        self.state["phi"] = phi_new
+        self.state["c"] = c_new
+        self.state["eta"] = eta_new
+        self.state["ux"] = self.last_mech["ux"]
+        self.state["uy"] = self.last_mech["uy"]
+
+    def step(self, step_idx: int) -> StepDiagnostics:
+        """执行一个总步（可能是 surrogate 步或物理步）。"""
+        dt = self.cfg.numerics.dt_s
+        used_surrogate_only = False
+        prev_phi = self.state["phi"].clone()
+        prev_c = self.state["c"].clone()
+        prev_eta = self.state["eta"].clone()
+        prev_epspeq = self.state["epspeq"].clone()
+        self._last_gate_metrics["pde_phi"] = 0.0
+        self._last_gate_metrics["pde_c"] = 0.0
+        self._last_gate_metrics["pde_eta"] = 0.0
+        self._last_gate_metrics["pde_mech"] = 0.0
+        self._last_gate_metrics["uncertainty"] = 0.0
+
+        ctx = torch.inference_mode if self.cfg.numerics.inference_mode else nullcontext
+        if self.device.type == "cuda":
+            amp_enabled = self.cfg.numerics.mixed_precision
+            amp_ctx = torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp_enabled)
+        else:
+            amp_ctx = nullcontext()
+        with ctx(), amp_ctx:
+            if self.surrogate is not None and self.cfg.ml.mode == "predictor_corrector":
+                # predictor-corrector 模式：优先 surrogate，周期性强制物理锚定。
+                anchor_every = max(0, int(self.cfg.ml.anchor_physics_every))
+                if anchor_every > 0 and step_idx % anchor_every == 0:
+                    # 锚定步：完整物理推进，重置拒绝计数。
+                    self._physics_step(dt, step_idx)
+                    self._surrogate_reject_streak = 0
+                    self._surrogate_pause_until_step = step_idx
+                else:
+                    roll = max(1, int(self._current_rollout_every))
+                    if step_idx < self._surrogate_pause_until_step:
+                        self._physics_step(dt, step_idx)
+                    elif step_idx % roll == 0:
+                        # surrogate 候选步：预测 -> 限幅 -> 门控 -> 接受或回退。
+                        self.stats["ml_surrogate_attempt"] += 1
+                        pred = self.surrogate.predict(self.state)
+                        pred = self._limit_surrogate_update(self.state, pred)
+                        if self._surrogate_update_is_valid(self.state, pred):
+                            self.stats["ml_surrogate_accept"] += 1
+                            self.state = pred
+                            if self.cfg.ml.enable_surrogate_mechanics_correction:
+                                # 可选：对 surrogate 状态再做一次力学校正。
+                                self.last_mech = self.mech.solve_quasi_static(
+                                    self.state,
+                                    self.epsp,
+                                    self.dx_um,
+                                    self.dy_um,
+                                    x_coords_um=self.x_coords_um,
+                                    y_coords_um=self.y_coords_um,
+                                )
+                                self.state["ux"] = self.last_mech["ux"]
+                                self.state["uy"] = self.last_mech["uy"]
+                            else:
+                                # 若不做校正，至少用当前位移场重建一致的应力诊断量。
+                                self.last_mech = self._estimate_state_mechanics(self.state)
+                            self._surrogate_reject_streak = 0
+                            self._surrogate_pause_until_step = step_idx
+                            self._on_surrogate_accept()
+                            used_surrogate_only = True
+                        else:
+                            self.stats["ml_surrogate_reject"] += 1
+                            # 门控失败：记录拒绝并回退到物理步。
+                            self._surrogate_reject_streak += 1
+                            self._on_surrogate_reject()
+                            if self._surrogate_reject_streak >= max(1, self.cfg.ml.max_consecutive_reject_before_pause):
+                                if self.cfg.ml.disable_surrogate_after_reject_burst:
+                                    self.surrogate = None
+                                    self._surrogate_pause_until_step = self.cfg.numerics.n_steps + 1
+                                else:
+                                    # 仅暂停若干步后再尝试 surrogate。
+                                    self._surrogate_pause_until_step = step_idx + max(1, self.cfg.ml.pause_steps_after_reject_burst)
+                                self._surrogate_reject_streak = 0
+                            self._physics_step(dt, step_idx)
+                    else:
+                        self._physics_step(dt, step_idx)
+            else:
+                self._physics_step(dt, step_idx)
+
+        self._sanitize_state()
+
+        # 诊断量均在清洗后的状态上计算，保证输出稳定且可比。
+        solid_fraction = float(self._mean_field(self.state["phi"]).item())
+        avg_eta = float(self._mean_field(self.state["eta"]).item())
+        solid = solid_indicator(self.state["phi"], self.cfg.domain.solid_phase_threshold)
+        max_sigma_h = float(torch.max(self.last_mech["sigma_h"] * solid).item())
+        avg_epspeq = float(self._mean_field(self.state["epspeq"]).item())
+        loss_phi_mae = float(self._mean_field(torch.abs(self.state["phi"] - prev_phi)).item())
+        loss_c_mae = float(self._mean_field(torch.abs(self.state["c"] - prev_c)).item())
+        loss_eta_mae = float(self._mean_field(torch.abs(self.state["eta"] - prev_eta)).item())
+        loss_epspeq_mae = float(self._mean_field(torch.abs(self.state["epspeq"] - prev_epspeq)).item())
+        mech_diag = self._estimate_state_mechanics(self.state)
+        free_energy = float(self._compute_free_energy(self.state, mech_diag))
+        self._last_gate_metrics["free_energy"] = free_energy
+        return StepDiagnostics(
+            step=step_idx,
+            time_s=step_idx * dt,
+            solid_fraction=solid_fraction,
+            avg_eta=avg_eta,
+            max_sigma_h=max_sigma_h,
+            avg_epspeq=avg_epspeq,
+            used_surrogate_only=used_surrogate_only,
+            loss_phi_mae=loss_phi_mae,
+            loss_c_mae=loss_c_mae,
+            loss_eta_mae=loss_eta_mae,
+            loss_epspeq_mae=loss_epspeq_mae,
+            free_energy=free_energy,
+            pde_res_phi=float(self._last_gate_metrics.get("pde_phi", 0.0)),
+            pde_res_c=float(self._last_gate_metrics.get("pde_c", 0.0)),
+            pde_res_eta=float(self._last_gate_metrics.get("pde_eta", 0.0)),
+            pde_res_mech=float(self._last_gate_metrics.get("pde_mech", 0.0)),
+            rollout_every=int(self._current_rollout_every),
+        )
+
+    def run(
+        self,
+        progress: bool = False,
+        progress_every: int = 50,
+        progress_prefix: str = "sim",
+    ) -> Dict[str, Path | float]:
+        """执行完整算例并按配置输出快照/图像/历史表。"""
+        t0_wall = time.perf_counter()
+        out_dir = ensure_dir(Path(self.cfg.runtime.output_dir) / self.cfg.runtime.case_name)
+        snap_dir = ensure_dir(out_dir / "snapshots")
+        fig_dir = ensure_dir(out_dir / "figures")
+        grid_dir = ensure_dir(out_dir / "grid")
+        if self.cfg.runtime.clean_output:
+            # 开启 clean_output 时先清理旧结果，再写入新结果。
+            for p in snap_dir.glob("snapshot_*.npz"):
+                p.unlink(missing_ok=True)
+            for p in fig_dir.glob("fields_*.*"):
+                p.unlink(missing_ok=True)
+            for p in grid_dir.glob("*.*"):
+                p.unlink(missing_ok=True)
+            cloud_dir = out_dir / "final_clouds"
+            if cloud_dir.exists():
+                for p in cloud_dir.glob("*.*"):
+                    p.unlink(missing_ok=True)
+            tip_dir = out_dir / "final_clouds_tip_zoom"
+            if tip_dir.exists():
+                for p in tip_dir.glob("*.*"):
+                    p.unlink(missing_ok=True)
+            (out_dir / "history.csv").unlink(missing_ok=True)
+
+        for i in range(1, self.cfg.numerics.n_steps + 1):
+            # 主时间推进循环。
+            diag = self.step(i)
+            self.history.append(
+                {
+                    "step": diag.step,
+                    "time_s": diag.time_s,
+                    "solid_fraction": diag.solid_fraction,
+                    "avg_eta": diag.avg_eta,
+                    "max_sigma_h": diag.max_sigma_h,
+                    "avg_epspeq": diag.avg_epspeq,
+                    "used_surrogate_only": float(diag.used_surrogate_only),
+                    "loss_phi_mae": diag.loss_phi_mae,
+                    "loss_c_mae": diag.loss_c_mae,
+                    "loss_eta_mae": diag.loss_eta_mae,
+                    "loss_epspeq_mae": diag.loss_epspeq_mae,
+                    "free_energy": diag.free_energy,
+                    "pde_res_phi": diag.pde_res_phi,
+                    "pde_res_c": diag.pde_res_c,
+                    "pde_res_eta": diag.pde_res_eta,
+                    "pde_res_mech": diag.pde_res_mech,
+                    "rollout_every": float(diag.rollout_every),
+                }
+            )
+            if progress and (i == 1 or i % max(1, progress_every) == 0 or i == self.cfg.numerics.n_steps):
+                frac = i / max(self.cfg.numerics.n_steps, 1)
+                bar_n = 28
+                fill = int(bar_n * frac)
+                bar = "#" * fill + "-" * (bar_n - fill)
+                total_t = self.cfg.numerics.n_steps * self.cfg.numerics.dt_s
+                wall_elapsed_s = time.perf_counter() - t0_wall
+                wall_eta_s = wall_elapsed_s * (1.0 - frac) / max(frac, 1e-12)
+                print(
+                    f"[{progress_prefix}] [{bar}] {frac*100:6.2f}% "
+                    f"t={diag.time_s:.6f}/{total_t:.6f} s dt={self.cfg.numerics.dt_s:.2e} s "
+                    f"wall={_fmt_wall_time(wall_elapsed_s)} eta_wall={_fmt_wall_time(wall_eta_s)} "
+                    f"phi={diag.solid_fraction:.6f} eta={diag.avg_eta:.6f} "
+                    f"sigma_h_max={diag.max_sigma_h:.3f} epspeq={diag.avg_epspeq:.6e} "
+                    f"loss_phi={diag.loss_phi_mae:.3e} loss_c={diag.loss_c_mae:.3e} "
+                    f"loss_eta={diag.loss_eta_mae:.3e} loss_epspeq={diag.loss_epspeq_mae:.3e} "
+                    f"F={diag.free_energy:.3e} "
+                    f"Rphi={diag.pde_res_phi:.2e} Rc={diag.pde_res_c:.2e} "
+                    f"Reta={diag.pde_res_eta:.2e} Rmech={diag.pde_res_mech:.2e} "
+                    f"roll={diag.rollout_every} surrogate={int(diag.used_surrogate_only)}"
+                )
+
+            if i % self.cfg.numerics.save_every == 0 or i == 1:
+                # 按保存节奏输出快照与中间图。
+                save_snapshot_npz(
+                    snap_dir,
+                    i,
+                    state=self.state,
+                    extras={
+                        "sigma_h": self.last_mech["sigma_h"],
+                        "sigma_xx": self.last_mech["sigma_xx"],
+                        "sigma_yy": self.last_mech["sigma_yy"],
+                        "sigma_xy": self.last_mech["sigma_xy"],
+                    },
+                )
+                if self.cfg.runtime.render_intermediate_fields:
+                    render_fields(
+                        fig_dir,
+                        i,
+                        self.state,
+                        self.last_mech["sigma_h"],
+                        self.state["epspeq"],
+                        time_s=diag.time_s,
+                        extent_um=(0.0, self.cfg.domain.lx_um, 0.0, self.cfg.domain.ly_um),
+                        show_grid=False,
+                        x_coords_um=self.x_coords_um,
+                        y_coords_um=self.y_coords_um,
+                    )
+
+        hist = save_history_csv(out_dir, self.history)
+        total_wall_s = time.perf_counter() - t0_wall
+        if self.cfg.runtime.render_final_clouds:
+            final_time_s = self.cfg.numerics.n_steps * self.cfg.numerics.dt_s
+            if self.cfg.domain.initial_geometry.lower() == "half_space" and self.cfg.domain.add_half_space_triangular_notch:
+                tip_center = (
+                    self.cfg.domain.half_space_notch_tip_x_um,
+                    self.cfg.domain.half_space_notch_center_y_um,
+                )
+            else:
+                tip_center = (
+                    self.cfg.domain.notch_tip_x_um,
+                    self.cfg.domain.notch_center_y_um,
+                )
+            tip_zoom_half_w = 0.5 * max(self.cfg.domain.tip_zoom_width_um, 1e-6)
+            tip_zoom_half_h = 0.5 * max(self.cfg.domain.tip_zoom_height_um, 1e-6)
+            render_final_clouds(
+                out_dir,
+                state=self.state,
+                sigma_xx=self.last_mech["sigma_xx"],
+                sigma_yy=self.last_mech["sigma_yy"],
+                sigma_xy=self.last_mech["sigma_xy"],
+                time_s=final_time_s,
+                extent_um=(0.0, self.cfg.domain.lx_um, 0.0, self.cfg.domain.ly_um),
+                show_grid=False,
+                x_coords_um=self.x_coords_um,
+                y_coords_um=self.y_coords_um,
+                save_svg=True,
+                tip_zoom_center_um=tip_center,
+                tip_zoom_half_width_um=tip_zoom_half_w,
+                tip_zoom_half_height_um=tip_zoom_half_h,
+            )
+        if self.cfg.runtime.render_grid_figure:
+            if self.cfg.domain.initial_geometry.lower() == "half_space" and self.cfg.domain.add_half_space_triangular_notch:
+                notch_tip_x = self.cfg.domain.half_space_notch_tip_x_um
+                notch_center_y = self.cfg.domain.half_space_notch_center_y_um
+                notch_depth = self.cfg.domain.half_space_notch_depth_um
+                notch_half_open = self.cfg.domain.half_space_notch_half_opening_um
+            else:
+                notch_tip_x = self.cfg.domain.notch_tip_x_um
+                notch_center_y = self.cfg.domain.notch_center_y_um
+                notch_depth = self.cfg.domain.notch_depth_um
+                notch_half_open = self.cfg.domain.notch_half_opening_um
+            render_grid_figure(
+                out_dir,
+                x_vec_um=self.x_coords_um,
+                y_vec_um=self.y_coords_um,
+                time_s=self.cfg.numerics.n_steps * self.cfg.numerics.dt_s,
+                notch_tip_x_um=notch_tip_x,
+                notch_center_y_um=notch_center_y,
+                notch_depth_um=notch_depth,
+                notch_half_opening_um=notch_half_open,
+            )
+        return {
+            "output_dir": out_dir,
+            "history_csv": hist,
+            "snapshots_dir": snap_dir,
+            "figures_dir": fig_dir,
+            "grid_dir": grid_dir,
+            "final_clouds_dir": out_dir / "final_clouds",
+            "wall_time_s": total_wall_s,
+        }
