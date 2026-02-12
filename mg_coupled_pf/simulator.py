@@ -25,6 +25,7 @@ from .crystal_plasticity import CrystalPlasticityModel
 from .geometry import Grid2D, initial_fields, make_grid, pitting_mobility_field
 from .io_utils import ensure_dir, render_fields, render_final_clouds, render_grid_figure, save_history_csv, save_snapshot_npz
 from .mechanics import MechanicsModel
+from .ml.mech_warmstart import load_mechanics_warmstart
 from .ml.surrogate import load_surrogate
 from .operators import (
     divergence,
@@ -136,6 +137,7 @@ class CoupledSimulator:
         }
 
         self.surrogate = None
+        self.mech_warmstart = None
         if cfg.ml.enabled:
             p = Path(cfg.ml.model_path)
             if p.exists():
@@ -166,6 +168,16 @@ class CoupledSimulator:
                 self.surrogate.loading_mode = str(cfg.mechanics.loading_mode)
                 self.surrogate.dirichlet_right_ux = float(self.mech._dirichlet_right_ux())
                 self.surrogate.enforce_uy_anchor = True
+            pm = Path(getattr(cfg.ml, "mechanics_warmstart_model_path", ""))
+            if bool(getattr(cfg.ml, "mechanics_warmstart_enabled", False)) and pm.exists():
+                self.mech_warmstart = load_mechanics_warmstart(
+                    pm,
+                    device=self.device,
+                    fallback_hidden=int(getattr(cfg.ml, "mechanics_warmstart_hidden", 24)),
+                    fallback_add_coord_features=bool(getattr(cfg.ml, "mechanics_warmstart_add_coord_features", True)),
+                    use_torch_compile=cfg.numerics.use_torch_compile and self.device.type == "cuda",
+                    channels_last=self.device.type == "cuda",
+                )
         self._surrogate_reject_streak = 0
         self._surrogate_pause_until_step = 0
         self._current_rollout_every = max(1, int(cfg.ml.rollout_every))
@@ -190,6 +202,8 @@ class CoupledSimulator:
             "mech_cg_failed": 0,
             "mech_cg_iters_sum": 0,
             "mech_ml_initial_guess_used": 0,
+            "mech_ml_initial_guess_mech_warmstart": 0,
+            "mech_ml_initial_guess_surrogate": 0,
             "ml_surrogate_attempt": 0,
             "ml_surrogate_accept": 0,
             "ml_surrogate_reject": 0,
@@ -1429,12 +1443,25 @@ class CoupledSimulator:
         # 仅在指定频率点或触发阈值满足时更新力学。
         do_mech_update = periodic_due or adaptive_due
         if do_mech_update:
-            if bool(self.cfg.numerics.mechanics_use_ml_initial_guess) and self.surrogate is not None:
-                # 可选：用 surrogate 位移场作为力学迭代初值（仅作初值，不替代物理求解）。
-                guess = self.surrogate.predict(self.state)
-                self.state["ux"] = torch.nan_to_num(guess["ux"], nan=0.0, posinf=0.0, neginf=0.0)
-                self.state["uy"] = torch.nan_to_num(guess["uy"], nan=0.0, posinf=0.0, neginf=0.0)
-                self.stats["mech_ml_initial_guess_used"] += 1
+            if bool(self.cfg.numerics.mechanics_use_ml_initial_guess):
+                # 优先使用“力学专用初值器”；若不存在则回退到通用 surrogate。
+                if self.mech_warmstart is not None:
+                    ux0, uy0 = self.mech_warmstart.predict(
+                        self.state,
+                        loading_mode=self.cfg.mechanics.loading_mode,
+                        right_disp_um=float(self.mech._dirichlet_right_ux()),
+                        enforce_anchor=True,
+                    )
+                    self.state["ux"] = ux0
+                    self.state["uy"] = uy0
+                    self.stats["mech_ml_initial_guess_used"] += 1
+                    self.stats["mech_ml_initial_guess_mech_warmstart"] += 1
+                elif self.surrogate is not None:
+                    guess = self.surrogate.predict(self.state)
+                    self.state["ux"] = torch.nan_to_num(guess["ux"], nan=0.0, posinf=0.0, neginf=0.0)
+                    self.state["uy"] = torch.nan_to_num(guess["uy"], nan=0.0, posinf=0.0, neginf=0.0)
+                    self.stats["mech_ml_initial_guess_used"] += 1
+                    self.stats["mech_ml_initial_guess_surrogate"] += 1
             # 1.1 预测力学平衡：基于当前位移/本征应变求解应力。
             mech_predict = self.mech.solve_quasi_static(
                 self.state,

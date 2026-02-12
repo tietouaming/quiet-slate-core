@@ -278,6 +278,11 @@ class MLConfig:
     surrogate_add_coord_features: bool = True
     # surrogate 输出后强制投影位移边界约束（ux 左端固定、可选右端 Dirichlet、uy 锚点）。
     surrogate_enforce_displacement_projection: bool = True
+    # 力学专用 ML 初值器：仅用于位移初值，不替代力学平衡求解。
+    mechanics_warmstart_enabled: bool = False
+    mechanics_warmstart_model_path: str = "artifacts/ml/mech_warmstart_latest.pt"
+    mechanics_warmstart_hidden: int = 24
+    mechanics_warmstart_add_coord_features: bool = True
     # surrogate 质量守恒门控：约束 cMg 全域平均的单步变化。
     enable_mass_gate: bool = True
     mass_abs_delta_max: float = 1e-4
