@@ -89,6 +89,13 @@ class NumericsConfig:
     mechanics_update_every: int = 1
     phi_integrator: str = "imex_helmholtz"
     eta_integrator: str = "imex_variable"
+    # phi-IMEX 中 L0 的选取策略：
+    # - max: 使用全场最大值（最稳健）
+    # - p95: 使用 95% 分位（兼顾稳定与耗散）
+    # - mean: 使用全场均值（仅建议做对照）
+    phi_imex_l0_strategy: str = "max"
+    phi_imex_l0_quantile: float = 0.95
+    phi_imex_l0_safety: float = 1.05
     imex_solver_iters: int = 80
     imex_solver_tol_abs: float = 1e-8
     imex_solver_tol_rel: float = 1e-5
@@ -152,6 +159,9 @@ class CorrosionConfig:
     yield_strain_for_mech: float = 0.002
     include_mech_term_in_phi_variation: bool = False
     include_twin_grad_term_in_phi_variation: bool = False
+    # 若启用 include_mech_term_in_phi_variation，则在自由能中加入一致的 -h(phi)*e_mech 近似项，
+    # 使 energy gate 与 PDE 演化目标保持一致。
+    include_mech_term_in_free_energy: bool = True
 
 
 @dataclass

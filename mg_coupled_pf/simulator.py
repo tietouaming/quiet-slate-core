@@ -211,6 +211,7 @@ class CoupledSimulator:
             "ml_reject_pde_eta": 0,
             "ml_reject_pde_mech": 0,
             "ml_reject_energy": 0,
+            "ml_energy_gate_skipped_nonvariational": 0,
             "ml_reject_uncertainty": 0,
             "ml_rollout_increase": 0,
             "ml_rollout_decrease": 0,
@@ -412,7 +413,13 @@ class CoupledSimulator:
         sigma_yy = mech_state["sigma_yy"]
         sigma_xy = mech_state["sigma_xy"]
         elastic = 0.5 * (sigma_xx * eps_xx + sigma_yy * eps_yy + 2.0 * sigma_xy * eps_xy)
-        total = chem + phi_dw + grad_phi + eta_barrier + grad_eta + elastic
+        mech_phi_coupling = torch.zeros_like(phi)
+        if bool(self.cfg.corrosion.include_mech_term_in_phi_variation) and bool(
+            getattr(self.cfg.corrosion, "include_mech_term_in_free_energy", True)
+        ):
+            # 与 phi_nonlin 中的 -h'(phi)*e_mech 保持一致：自由能项取 -h(phi)*e_mech。
+            mech_phi_coupling = -hphi * self._mech_phi_coupling_energy_density(mech_state)
+        total = chem + phi_dw + grad_phi + eta_barrier + grad_eta + elastic + mech_phi_coupling
         total = torch.nan_to_num(total, nan=0.0, posinf=0.0, neginf=0.0)
         return float(self._mean_field(total).item())
 
@@ -439,11 +446,7 @@ class CoupledSimulator:
         chem_drive = -self.cfg.corrosion.A_J_m3 / 1e6 * (cbar - hphi * delta_eq - cl_eq) * delta_eq * hphi_d
         phi_nonlin = chem_drive + omega * double_well_prime(phi, clamp_input=False)
         if self.cfg.corrosion.include_mech_term_in_phi_variation:
-            e_mech = 0.5 * (
-                mech_state["sigma_xx"] * mech_state["sigma_xx"]
-                + mech_state["sigma_yy"] * mech_state["sigma_yy"]
-                + 2.0 * mech_state["sigma_xy"] * mech_state["sigma_xy"]
-            ) / max(self.cfg.mechanics.mu_GPa * 1e3, 1e-9)
+            e_mech = self._mech_phi_coupling_energy_density(mech_state)
             phi_nonlin = phi_nonlin - hphi_d * e_mech
         if self.cfg.corrosion.include_twin_grad_term_in_phi_variation and self.cfg.twinning.scale_twin_gradient_by_hphi:
             # 与 eta-TDGL 保持一致：kappa_eta 与 eta 梯度统一采用 um 尺度。
@@ -456,7 +459,8 @@ class CoupledSimulator:
                 bc=bc,
             )
             twin_grad_e = 0.5 * self.cfg.twinning.kappa_eta * (gx_eta_um * gx_eta_um + gy_eta_um * gy_eta_um)
-            phi_nonlin = phi_nonlin - hphi_d * twin_grad_e
+            # 变分一致性：F 中为 +0.5*kappa_eta*h(phi)|grad eta|^2，则 dF/dphi 为 +h'(phi)*twin_grad_e。
+            phi_nonlin = phi_nonlin + hphi_d * twin_grad_e
         L_phi = torch.clamp(self._corrosion_mobility(state=nxt, mech=mech_state), min=0.0)
         phi_lap_kappa = self._div_diffusive_fv(
             phi,
@@ -546,11 +550,11 @@ class CoupledSimulator:
                 noise = torch.randn_like(v) * std
                 vv = v + noise
                 if k == "phi":
-                    vv = torch.clamp(vv, 0.0, 1.0)
+                    vv = self._soft_project_range(vv, 0.0, 1.0)
                 elif k == "c":
-                    vv = torch.clamp(vv, self.cfg.corrosion.cMg_min, self.cfg.corrosion.cMg_max)
+                    vv = self._soft_project_range(vv, self.cfg.corrosion.cMg_min, self.cfg.corrosion.cMg_max)
                 elif k == "eta":
-                    vv = torch.clamp(vv, 0.0, 1.0)
+                    vv = self._soft_project_range(vv, 0.0, 1.0)
                 elif k == "epspeq":
                     vv = torch.clamp(vv, 0.0, 1e6)
                 elif k in {"epsp_xx", "epsp_yy", "epsp_xy"}:
@@ -1117,6 +1121,30 @@ class CoupledSimulator:
             out = out * cp.corrosion_mobility_multiplier(st, mech_state)
         return out
 
+    def _mech_phi_coupling_energy_density(self, mech_state: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """与 phi 变分耦合一致的机械能近似密度 e_mech。"""
+        return 0.5 * (
+            mech_state["sigma_xx"] * mech_state["sigma_xx"]
+            + mech_state["sigma_yy"] * mech_state["sigma_yy"]
+            + 2.0 * mech_state["sigma_xy"] * mech_state["sigma_xy"]
+        ) / max(self.cfg.mechanics.mu_GPa * 1e3, 1e-9)
+
+    def _select_phi_imex_l0(self, L_phi_pos: torch.Tensor) -> float:
+        """选择 phi-IMEX 的常数 L0（用于常系数隐式+显式补偿分裂）。"""
+        strategy = str(getattr(self.cfg.numerics, "phi_imex_l0_strategy", "max")).strip().lower()
+        safety = max(float(getattr(self.cfg.numerics, "phi_imex_l0_safety", 1.0)), 1e-8)
+        if strategy in {"max", "upper"}:
+            base = float(torch.max(L_phi_pos).item())
+        elif strategy in {"p95", "q95", "quantile"}:
+            q = float(getattr(self.cfg.numerics, "phi_imex_l0_quantile", 0.95))
+            q = min(max(q, 0.0), 1.0)
+            base = float(torch.quantile(L_phi_pos.reshape(-1), q).item())
+        elif strategy in {"mean", "avg", "average"}:
+            base = float(torch.mean(L_phi_pos).item())
+        else:
+            base = float(torch.max(L_phi_pos).item())
+        return max(base * safety, 0.0)
+
     def _resolved_twin_shear(self, sigma_xx: torch.Tensor, sigma_yy: torch.Tensor, sigma_xy: torch.Tensor) -> torch.Tensor:
         """计算孪晶系分解剪应力。"""
         tau = self.twin_sx * (sigma_xx * self.twin_nx + sigma_xy * self.twin_ny) + self.twin_sy * (
@@ -1310,7 +1338,15 @@ class CoupledSimulator:
             ):
                 return reject("pde_mech")
 
-        if bool(self.cfg.ml.enable_energy_gate):
+        energy_gate_enabled = bool(self.cfg.ml.enable_energy_gate)
+        if energy_gate_enabled and bool(self.cfg.corrosion.include_mech_term_in_phi_variation) and (
+            not bool(getattr(self.cfg.corrosion, "include_mech_term_in_free_energy", True))
+        ):
+            # 当机械-phi 驱动未写入自由能时，能量门控不再具有变分意义，自动跳过。
+            energy_gate_enabled = False
+            self.stats["ml_energy_gate_skipped_nonvariational"] += 1
+
+        if energy_gate_enabled:
             e_prev = self._compute_free_energy(prev, mech_prev)
             e_nxt = self._compute_free_energy(nxt, mech_nxt)
             self._last_gate_metrics["free_energy"] = float(e_nxt)
@@ -1494,11 +1530,7 @@ class CoupledSimulator:
 
         if self.cfg.corrosion.include_mech_term_in_phi_variation:
             # Optional "full variational" route.
-            e_mech = 0.5 * (
-                self.last_mech["sigma_xx"] * self.last_mech["sigma_xx"]
-                + self.last_mech["sigma_yy"] * self.last_mech["sigma_yy"]
-                + 2.0 * self.last_mech["sigma_xy"] * self.last_mech["sigma_xy"]
-            ) / max(self.cfg.mechanics.mu_GPa * 1e3, 1e-9)
+            e_mech = self._mech_phi_coupling_energy_density(self.last_mech)
             phi_nonlin = phi_nonlin - hphi_d * e_mech
 
         if self.cfg.corrosion.include_twin_grad_term_in_phi_variation and self.cfg.twinning.scale_twin_gradient_by_hphi:
@@ -1512,7 +1544,7 @@ class CoupledSimulator:
                 bc=bc,
             )
             twin_grad_e = 0.5 * self.cfg.twinning.kappa_eta * (gx_eta_um * gx_eta_um + gy_eta_um * gy_eta_um)
-            phi_nonlin = phi_nonlin - hphi_d * twin_grad_e
+            phi_nonlin = phi_nonlin + hphi_d * twin_grad_e
 
         L_phi = self._corrosion_mobility()
         phi_nonlin = torch.nan_to_num(phi_nonlin, nan=0.0, posinf=0.0, neginf=0.0)
@@ -1531,7 +1563,7 @@ class CoupledSimulator:
         phi_mode = str(self.cfg.numerics.phi_integrator).strip().lower()
         if phi_mode.startswith("imex"):
             # IMEX-L0 分裂：隐式部分使用常数 L0，显式补偿 (L-L0) 项，避免引入 grad(L) 假项。
-            L0 = max(float(self._mean_field(L_phi_pos).item()), 0.0)
+            L0 = self._select_phi_imex_l0(L_phi_pos)
             if L0 > 1e-18:
                 rhs_phi = phi - dt_s * L_phi_pos * phi_nonlin + dt_s * (L_phi_pos - L0) * phi_lap_kappa_prev
                 phi_new = self._solve_variable_diffusion_imex(

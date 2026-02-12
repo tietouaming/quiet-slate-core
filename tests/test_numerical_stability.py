@@ -9,7 +9,7 @@ import torch
 from mg_coupled_pf import CoupledSimulator, load_config
 from mg_coupled_pf.crystal_plasticity import CrystalPlasticityModel
 from mg_coupled_pf.mechanics import MechanicsModel
-from mg_coupled_pf.operators import double_well_prime, smooth_heaviside, smooth_heaviside_prime
+from mg_coupled_pf.operators import double_well_prime, grad_xy, smooth_heaviside, smooth_heaviside_prime
 
 
 def test_short_run_stability() -> None:
@@ -470,6 +470,135 @@ def test_phi_residual_uses_allen_cahn_l_times_laplacian_form() -> None:
     r_expected = (phi - prev["phi"]) / max(dt, 1e-12) + L_phi * (phi_nonlin - phi_lap_kappa)
     pde_expected = sim._masked_mean_abs(r_expected)
     assert abs(float(got["pde_phi"]) - float(pde_expected)) < 1e-10
+
+
+def test_phi_twin_gradient_variation_sign_consistent() -> None:
+    """验证孪晶梯度能对 phi 变分项符号与自由能定义一致（正号）。"""
+    cfg = load_config("configs/notch_case.yaml")
+    cfg.runtime.device = "cpu"
+    cfg.ml.enabled = False
+    cfg.domain.nx = 40
+    cfg.domain.ny = 28
+    cfg.corrosion.include_mech_term_in_phi_variation = False
+    cfg.corrosion.include_twin_grad_term_in_phi_variation = True
+    cfg.twinning.scale_twin_gradient_by_hphi = True
+    sim = CoupledSimulator(cfg)
+
+    prev = {k: v.clone() for k, v in sim.state.items()}
+    nxt = {k: v.clone() for k, v in sim.state.items()}
+    xx = torch.linspace(0.1, 0.9, cfg.domain.nx, dtype=sim.state["phi"].dtype).view(1, 1, 1, -1)
+    yy = torch.linspace(0.0, 1.0, cfg.domain.ny, dtype=sim.state["eta"].dtype).view(1, 1, -1, 1)
+    nxt["phi"] = xx.expand_as(prev["phi"])
+    nxt["eta"] = yy.expand_as(prev["eta"])
+    nxt["c"] = torch.full_like(prev["c"], 0.45)
+    dt = float(cfg.numerics.dt_s)
+
+    mech = sim._estimate_state_mechanics(nxt)
+    got = sim._compute_pde_residuals(prev, nxt, mech, dt_s=dt)
+
+    phi = torch.nan_to_num(nxt["phi"], nan=0.5, posinf=1.0, neginf=0.0)
+    cbar = torch.nan_to_num(nxt["c"], nan=0.5, posinf=cfg.corrosion.cMg_max, neginf=cfg.corrosion.cMg_min)
+    eta = torch.nan_to_num(nxt["eta"], nan=0.0, posinf=1.0, neginf=0.0)
+    hphi = smooth_heaviside(phi, clamp_input=False)
+    hphi_d = smooth_heaviside_prime(phi, clamp_input=False)
+    delta_eq = cfg.corrosion.c_s_eq_norm - cfg.corrosion.c_l_eq_norm
+    chem_drive = -cfg.corrosion.A_J_m3 / 1e6 * (cbar - hphi * delta_eq - cfg.corrosion.c_l_eq_norm) * delta_eq * hphi_d
+    omega, kappa_phi = sim._omega_kappa_phi()
+    phi_nonlin = chem_drive + omega * double_well_prime(phi, clamp_input=False)
+    gx_eta_um, gy_eta_um = grad_xy(
+        eta,
+        sim.dx_um,
+        sim.dy_um,
+        x_coords=sim.x_coords_um,
+        y_coords=sim.y_coords_um,
+        bc=sim._scalar_bc(),
+    )
+    twin_grad_e = 0.5 * cfg.twinning.kappa_eta * (gx_eta_um * gx_eta_um + gy_eta_um * gy_eta_um)
+    phi_nonlin = phi_nonlin + hphi_d * twin_grad_e
+    L_phi = torch.clamp(sim._corrosion_mobility(state=nxt, mech=mech), min=0.0)
+    phi_lap_kappa = sim._div_diffusive_fv(
+        phi,
+        torch.full_like(phi, float(kappa_phi)),
+        dx=sim.dx_m,
+        dy=sim.dy_m,
+        x_coords=sim.x_coords_m,
+        y_coords=sim.y_coords_m,
+        bc=sim._scalar_bc(),
+    )
+    r_expected = (phi - prev["phi"]) / max(dt, 1e-12) + L_phi * (phi_nonlin - phi_lap_kappa)
+    pde_expected = sim._masked_mean_abs(r_expected)
+    assert abs(float(got["pde_phi"]) - float(pde_expected)) < 1e-9
+
+
+def test_free_energy_includes_mech_phi_coupling_when_enabled() -> None:
+    """验证 include_mech_term_in_free_energy 会写入与 phi 方程一致的机械耦合能项。"""
+    cfg = load_config("configs/notch_case.yaml")
+    cfg.runtime.device = "cpu"
+    cfg.ml.enabled = False
+    cfg.domain.nx = 36
+    cfg.domain.ny = 24
+    cfg.corrosion.include_mech_term_in_phi_variation = True
+    cfg.corrosion.include_mech_term_in_free_energy = True
+    sim = CoupledSimulator(cfg)
+    state = {k: v.clone() for k, v in sim.state.items()}
+    mech = sim._estimate_state_mechanics(state)
+
+    e_with = sim._compute_free_energy(state, mech)
+    cfg.corrosion.include_mech_term_in_free_energy = False
+    sim_ref = CoupledSimulator(cfg)
+    sim_ref.state = {k: v.clone() for k, v in state.items()}
+    e_without = sim_ref._compute_free_energy(state, mech)
+
+    hphi = smooth_heaviside(torch.clamp(state["phi"], 0.0, 1.0))
+    e_mech = sim._mech_phi_coupling_energy_density(mech)
+    expected_delta = -float(sim._mean_field(hphi * e_mech).item())
+    got_delta = float(e_with - e_without)
+    assert abs(got_delta - expected_delta) < 1e-6
+
+
+def test_energy_gate_auto_skips_when_nonvariational_mech_term_enabled() -> None:
+    """当机械驱动未写入自由能时，energy gate 应自动跳过。"""
+    cfg = load_config("configs/notch_case.yaml")
+    cfg.runtime.device = "cpu"
+    cfg.domain.nx = 40
+    cfg.domain.ny = 28
+    cfg.ml.enabled = False
+    cfg.ml.max_field_delta = 10.0
+    cfg.ml.max_mean_phi_drop = 10.0
+    cfg.ml.max_mean_eta_rise = 10.0
+    cfg.ml.max_mean_phi_abs_delta = 10.0
+    cfg.ml.max_mean_eta_abs_delta = 10.0
+    cfg.ml.max_mean_c_abs_delta = 10.0
+    cfg.ml.max_mean_epspeq_abs_delta = 10.0
+    cfg.ml.residual_gate = 10.0
+    cfg.ml.enable_pde_residual_gate = False
+    cfg.ml.enable_energy_gate = True
+    cfg.corrosion.include_mech_term_in_phi_variation = True
+    cfg.corrosion.include_mech_term_in_free_energy = False
+    sim = CoupledSimulator(cfg)
+    prev = {k: v.clone() for k, v in sim.state.items()}
+    nxt = {k: v.clone() for k, v in prev.items()}
+    nxt["phi"] = torch.clamp(prev["phi"] + 0.02, 0.0, 1.0)
+    _ = sim._surrogate_update_is_valid(prev, nxt)
+    assert sim.stats["ml_energy_gate_skipped_nonvariational"] > 0
+
+
+def test_phi_imex_l0_strategy_max_not_lower_than_mean() -> None:
+    """L0=max 策略在同一场上不应小于 mean 策略。"""
+    cfg = load_config("configs/notch_case.yaml")
+    cfg.runtime.device = "cpu"
+    cfg.ml.enabled = False
+    cfg.domain.nx = 12
+    cfg.domain.ny = 8
+    sim = CoupledSimulator(cfg)
+    l = torch.tensor([[[[0.1, 0.2, 0.3], [0.4, 0.5, 2.0]]]], dtype=torch.float32)
+    cfg.numerics.phi_imex_l0_safety = 1.0
+    cfg.numerics.phi_imex_l0_strategy = "mean"
+    l_mean = sim._select_phi_imex_l0(l)
+    cfg.numerics.phi_imex_l0_strategy = "max"
+    l_max = sim._select_phi_imex_l0(l)
+    assert l_max >= l_mean
+    assert abs(l_max - 2.0) < 1e-6
 
 
 def test_mechanics_dirichlet_nonzero_right_value_enters_ux_gradient() -> None:
