@@ -341,7 +341,13 @@ class CoupledSimulator:
             x_coords_um=self.x_coords_um,
             y_coords_um=self.y_coords_um,
         )
-        sig = self.mech.constitutive_stress(state["phi"], eps["eps_xx"], eps["eps_yy"], eps["eps_xy"])
+        sig = self.mech.constitutive_stress(
+            state["phi"],
+            eps["eps_xx"],
+            eps["eps_yy"],
+            eps["eps_xy"],
+            eta=state.get("eta"),
+        )
         out = {
             "ux": torch.nan_to_num(state["ux"], nan=0.0, posinf=0.0, neginf=0.0),
             "uy": torch.nan_to_num(state["uy"], nan=0.0, posinf=0.0, neginf=0.0),

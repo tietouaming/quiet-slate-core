@@ -16,6 +16,128 @@ from .config import SimulationConfig
 from .operators import grad_xy, smooth_heaviside
 
 
+def _normalize_vec3(v: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """三维向量归一化。"""
+    n = torch.sqrt(torch.clamp(torch.sum(v * v), min=eps))
+    return v / n
+
+
+def _bunge_euler_matrix(euler_deg: List[float], *, dtype: torch.dtype = torch.float64) -> torch.Tensor:
+    """Bunge ZXZ 欧拉角旋转矩阵（晶体系 -> 试样系）。"""
+    if len(euler_deg) != 3:
+        raise ValueError("crystal_orientation_euler_deg must have length 3.")
+    a, b, c = [torch.deg2rad(torch.tensor(float(x), dtype=dtype)) for x in euler_deg]
+    ca, sa = torch.cos(a), torch.sin(a)
+    cb, sb = torch.cos(b), torch.sin(b)
+    cc, sc = torch.cos(c), torch.sin(c)
+    z = torch.tensor(0.0, dtype=dtype)
+    o = torch.tensor(1.0, dtype=dtype)
+    rz1 = torch.stack(
+        [
+            torch.stack([ca, -sa, z]),
+            torch.stack([sa, ca, z]),
+            torch.stack([z, z, o]),
+        ]
+    )
+    rx = torch.stack(
+        [
+            torch.stack([o, z, z]),
+            torch.stack([z, cb, -sb]),
+            torch.stack([z, sb, cb]),
+        ]
+    )
+    rz2 = torch.stack(
+        [
+            torch.stack([cc, -sc, z]),
+            torch.stack([sc, cc, z]),
+            torch.stack([z, z, o]),
+        ]
+    )
+    return rz1 @ rx @ rz2
+
+
+def _axis_angle_matrix(axis: List[float], angle_deg: float, *, dtype: torch.dtype = torch.float64) -> torch.Tensor:
+    """轴角旋转矩阵（Rodrigues）。"""
+    if len(axis) != 3:
+        raise ValueError("twin_reorientation_axis must have length 3.")
+    ax = _normalize_vec3(torch.tensor([float(axis[0]), float(axis[1]), float(axis[2])], dtype=dtype))
+    th = torch.deg2rad(torch.tensor(float(angle_deg), dtype=dtype))
+    c = torch.cos(th)
+    s = torch.sin(th)
+    x, y, z = ax[0], ax[1], ax[2]
+    k = torch.tensor(
+        [
+            [0.0, -z.item(), y.item()],
+            [z.item(), 0.0, -x.item()],
+            [-y.item(), x.item(), 0.0],
+        ],
+        dtype=dtype,
+    )
+    i = torch.eye(3, dtype=dtype)
+    outer = ax.view(3, 1) @ ax.view(1, 3)
+    return c * i + (1.0 - c) * outer + s * k
+
+
+def _build_hcp_stiffness_tensor(
+    c11: float,
+    c12: float,
+    c13: float,
+    c33: float,
+    c44: float,
+    *,
+    dtype: torch.dtype = torch.float64,
+) -> torch.Tensor:
+    """构造 HCP 晶体坐标系下的四阶弹性张量 C_ijkl（MPa）。"""
+    c = torch.zeros((3, 3, 3, 3), dtype=dtype)
+    c66 = 0.5 * (c11 - c12)
+
+    def set_sym(i: int, j: int, k: int, l: int, val: float) -> None:
+        idx = (
+            (i, j, k, l),
+            (j, i, k, l),
+            (i, j, l, k),
+            (j, i, l, k),
+            (k, l, i, j),
+            (l, k, i, j),
+            (k, l, j, i),
+            (l, k, j, i),
+        )
+        for a, b, d, e in idx:
+            c[a, b, d, e] = float(val)
+
+    set_sym(0, 0, 0, 0, c11)
+    set_sym(1, 1, 1, 1, c11)
+    set_sym(0, 0, 1, 1, c12)
+    set_sym(0, 0, 2, 2, c13)
+    set_sym(1, 1, 2, 2, c13)
+    set_sym(2, 2, 2, 2, c33)
+    set_sym(1, 2, 1, 2, c44)
+    set_sym(0, 2, 0, 2, c44)
+    set_sym(0, 1, 0, 1, c66)
+    return c
+
+
+def _rotate_stiffness(c: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
+    """将四阶弹性张量从晶体系旋转到试样系。"""
+    return torch.einsum("ai,bj,ck,dl,ijkl->abcd", r, r, r, r, c)
+
+
+def _extract_plane_strain_coeffs(c: torch.Tensor) -> Dict[str, float]:
+    """提取二维平面应变使用的应力-应变线性系数。"""
+    out: Dict[str, float] = {}
+    pairs = {
+        "xx": (0, 0),
+        "yy": (1, 1),
+        "xy": (0, 1),
+        "zz": (2, 2),
+    }
+    for name, (i, j) in pairs.items():
+        out[f"{name}_exx"] = float(c[i, j, 0, 0].item())
+        out[f"{name}_eyy"] = float(c[i, j, 1, 1].item())
+        out[f"{name}_exy"] = float((c[i, j, 0, 1] + c[i, j, 1, 0]).item())
+    return out
+
+
 class MechanicsModel:
     """准静态力学求解器。"""
 
@@ -24,6 +146,38 @@ class MechanicsModel:
         self.cfg = cfg
         self.lam = cfg.mechanics.lambda_GPa * 1e3  # MPa
         self.mu = cfg.mechanics.mu_GPa * 1e3  # MPa
+        self.use_anisotropic_hcp = bool(getattr(cfg.mechanics, "use_anisotropic_hcp", False))
+        self.anisotropic_blend_with_twin = bool(getattr(cfg.mechanics, "anisotropic_blend_with_twin", True))
+
+        # 默认刚度尺度：各向同性模型的切线模量。
+        self._stiffness_ref_mpa = float(self.lam + 2.0 * self.mu)
+        self._c_parent_coeffs: Dict[str, float] | None = None
+        self._c_twin_coeffs: Dict[str, float] | None = None
+        if self.use_anisotropic_hcp:
+            c11 = float(cfg.mechanics.C11_GPa) * 1e3
+            c12 = float(cfg.mechanics.C12_GPa) * 1e3
+            c13 = float(cfg.mechanics.C13_GPa) * 1e3
+            c33 = float(cfg.mechanics.C33_GPa) * 1e3
+            c44 = float(cfg.mechanics.C44_GPa) * 1e3
+            c0 = _build_hcp_stiffness_tensor(c11, c12, c13, c33, c44)
+            euler = list(getattr(cfg.mechanics, "crystal_orientation_euler_deg", [0.0, 0.0, 0.0]))
+            tw_axis = list(getattr(cfg.mechanics, "twin_reorientation_axis", [0.0, 0.0, 1.0]))
+            tw_ang = float(getattr(cfg.mechanics, "twin_reorientation_angle_deg", 86.3))
+            r_parent = _bunge_euler_matrix(euler)
+            r_twin = _axis_angle_matrix(tw_axis, tw_ang) @ r_parent
+            c_parent = _rotate_stiffness(c0, r_parent)
+            c_twin = _rotate_stiffness(c0, r_twin)
+            self._c_parent_coeffs = _extract_plane_strain_coeffs(c_parent)
+            self._c_twin_coeffs = _extract_plane_strain_coeffs(c_twin)
+            # 线性求解器预条件的刚度参考值取主要系数上界，提升各向异性下的鲁棒性。
+            cand: List[float] = []
+            for coeffs in [self._c_parent_coeffs, self._c_twin_coeffs]:
+                if coeffs is None:
+                    continue
+                for k in ("xx_exx", "xx_eyy", "xx_exy", "yy_exx", "yy_eyy", "yy_exy", "xy_exx", "xy_eyy", "xy_exy"):
+                    cand.append(abs(float(coeffs.get(k, 0.0))))
+            if cand:
+                self._stiffness_ref_mpa = max(max(cand), 1e-6)
 
         ang_s = torch.deg2rad(torch.tensor(cfg.twinning.twin_shear_dir_angle_deg, dtype=torch.float64))
         ang_n = torch.deg2rad(torch.tensor(cfg.twinning.twin_plane_normal_angle_deg, dtype=torch.float64))
@@ -92,6 +246,8 @@ class MechanicsModel:
         eps_xx: torch.Tensor,
         eps_yy: torch.Tensor,
         eps_xy: torch.Tensor,
+        *,
+        eta: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         """线弹性本构：由应变场计算 Cauchy 应力。"""
         hphi = smooth_heaviside(phi)
@@ -101,15 +257,41 @@ class MechanicsModel:
             band = 0.02
             gate = 0.5 * (1.0 + torch.tanh((phi - thr) / band))
             hphi = hphi * torch.clamp(gate, 0.0, 1.0)
-        tr = eps_xx + eps_yy
-        sigma_xx = hphi * (self.lam * tr + 2.0 * self.mu * eps_xx)
-        sigma_yy = hphi * (self.lam * tr + 2.0 * self.mu * eps_yy)
-        sigma_xy = hphi * (2.0 * self.mu * eps_xy)
-        if bool(self.cfg.mechanics.plane_strain):
-            # 平面应变下 ezz=0，但 szz=lambda*(exx+eyy) 一般不为 0。
-            sigma_zz = hphi * (self.lam * tr)
+
+        def compose_from_coeffs(coeffs: Dict[str, float]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            sxx = coeffs["xx_exx"] * eps_xx + coeffs["xx_eyy"] * eps_yy + coeffs["xx_exy"] * eps_xy
+            syy = coeffs["yy_exx"] * eps_xx + coeffs["yy_eyy"] * eps_yy + coeffs["yy_exy"] * eps_xy
+            sxy = coeffs["xy_exx"] * eps_xx + coeffs["xy_eyy"] * eps_yy + coeffs["xy_exy"] * eps_xy
+            szz = coeffs["zz_exx"] * eps_xx + coeffs["zz_eyy"] * eps_yy + coeffs["zz_exy"] * eps_xy
+            return sxx, syy, sxy, szz
+
+        if self.use_anisotropic_hcp and self._c_parent_coeffs is not None:
+            sxx_m, syy_m, sxy_m, szz_m = compose_from_coeffs(self._c_parent_coeffs)
+            if self.anisotropic_blend_with_twin and (eta is not None) and (self._c_twin_coeffs is not None):
+                sxx_t, syy_t, sxy_t, szz_t = compose_from_coeffs(self._c_twin_coeffs)
+                wt = smooth_heaviside(torch.clamp(eta, 0.0, 1.0))
+                sigma_xx = (1.0 - wt) * sxx_m + wt * sxx_t
+                sigma_yy = (1.0 - wt) * syy_m + wt * syy_t
+                sigma_xy = (1.0 - wt) * sxy_m + wt * sxy_t
+                sigma_zz = (1.0 - wt) * szz_m + wt * szz_t
+            else:
+                sigma_xx, sigma_yy, sigma_xy, sigma_zz = sxx_m, syy_m, sxy_m, szz_m
+            if not bool(self.cfg.mechanics.plane_strain):
+                sigma_zz = torch.zeros_like(sigma_xx)
+            sigma_xx = hphi * sigma_xx
+            sigma_yy = hphi * sigma_yy
+            sigma_xy = hphi * sigma_xy
+            sigma_zz = hphi * sigma_zz
         else:
-            sigma_zz = torch.zeros_like(sigma_xx)
+            tr = eps_xx + eps_yy
+            sigma_xx = hphi * (self.lam * tr + 2.0 * self.mu * eps_xx)
+            sigma_yy = hphi * (self.lam * tr + 2.0 * self.mu * eps_yy)
+            sigma_xy = hphi * (2.0 * self.mu * eps_xy)
+            if bool(self.cfg.mechanics.plane_strain):
+                # 平面应变下 ezz=0，但 szz=lambda*(exx+eyy) 一般不为 0。
+                sigma_zz = hphi * (self.lam * tr)
+            else:
+                sigma_zz = torch.zeros_like(sigma_xx)
         sigma_h = (sigma_xx + sigma_yy + sigma_zz) / 3.0
         return {
             "sigma_xx": sigma_xx,
@@ -417,7 +599,7 @@ class MechanicsModel:
         ex0 = self._macro_external_strain_x() - epsp["exx"] - eps_tw["exx"]
         ey0 = -epsp["eyy"] - eps_tw["eyy"]
         exy0 = -epsp["exy"] - eps_tw["exy"]
-        sig0 = self.constitutive_stress(phi, ex0, ey0, exy0)
+        sig0 = self.constitutive_stress(phi, ex0, ey0, exy0, eta=eta)
         div0_x, div0_y = self._stress_divergence(
             sig0["sigma_xx"],
             sig0["sigma_yy"],
@@ -442,7 +624,7 @@ class MechanicsModel:
                 x_coords_um=x_coords_um,
                 y_coords_um=y_coords_um,
             )
-            sig_u = self.constitutive_stress(phi, eps_u["eps_xx"], eps_u["eps_yy"], eps_u["eps_xy"])
+            sig_u = self.constitutive_stress(phi, eps_u["eps_xx"], eps_u["eps_yy"], eps_u["eps_xy"], eta=eta)
             ax, ay = self._stress_divergence(
                 sig_u["sigma_xx"],
                 sig_u["sigma_yy"],
@@ -496,7 +678,7 @@ class MechanicsModel:
             dy_min = float(dy_um)
         diag_lap = 2.0 / max(dx_min * dx_min, 1e-20) + 2.0 / max(dy_min * dy_min, 1e-20)
         shift = max(float(self.cfg.numerics.mechanics_cg_diag_shift), 1e-9)
-        diag = hphi * (self.lam + 2.0 * self.mu) * diag_lap + shift
+        diag = hphi * max(float(self._stiffness_ref_mpa), 1e-6) * diag_lap + shift
         diag_inv = 1.0 / torch.clamp(diag, min=shift)
         n_iter = max(1, int(self.cfg.numerics.mechanics_cg_max_iters))
         abs_tol = max(float(self.cfg.numerics.mechanics_cg_tol_abs), 0.0)
@@ -738,7 +920,7 @@ class MechanicsModel:
         eta = state["eta"]
         phi = state["phi"]
         relax = self.cfg.numerics.mechanics_relaxation
-        stiff = max(self.lam + 2.0 * self.mu, 1e-9)
+        stiff = max(float(self._stiffness_ref_mpa), 1e-9)
         h = max(min(dx_um, dy_um), 1e-9)
         damping = max(self.cfg.mechanics.residual_damping_MPa_um, 1e-9)
         max_u = self.cfg.mechanics.max_abs_displacement_um
@@ -766,7 +948,7 @@ class MechanicsModel:
                 x_coords_um=x_coords_um,
                 y_coords_um=y_coords_um,
             )
-            sig = self.constitutive_stress(phi, eps["eps_xx"], eps["eps_yy"], eps["eps_xy"])
+            sig = self.constitutive_stress(phi, eps["eps_xx"], eps["eps_yy"], eps["eps_xy"], eta=eta)
             div_x, div_y = self._stress_divergence(
                 sig["sigma_xx"],
                 sig["sigma_yy"],
@@ -873,7 +1055,7 @@ class MechanicsModel:
             x_coords_um=x_coords_um,
             y_coords_um=y_coords_um,
         )
-        sig = self.constitutive_stress(phi, eps["eps_xx"], eps["eps_yy"], eps["eps_xy"])
+        sig = self.constitutive_stress(phi, eps["eps_xx"], eps["eps_yy"], eps["eps_xy"], eta=eta)
         sig = {k: torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0) for k, v in sig.items()}
 
         return {

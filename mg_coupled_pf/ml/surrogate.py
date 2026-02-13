@@ -19,6 +19,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..operators import smooth_heaviside
+
 
 FIELD_ORDER = ["phi", "c", "eta", "ux", "uy", "epspeq", "epsp_xx", "epsp_yy", "epsp_xy"]
 
@@ -405,7 +407,8 @@ class SurrogatePredictor:
         nxt["epsp_xx"] = torch.clamp(torch.nan_to_num(nxt["epsp_xx"], nan=0.0, posinf=0.0, neginf=0.0), min=-1.0, max=1.0)
         nxt["epsp_yy"] = torch.clamp(torch.nan_to_num(nxt["epsp_yy"], nan=0.0, posinf=0.0, neginf=0.0), min=-1.0, max=1.0)
         nxt["epsp_xy"] = torch.clamp(torch.nan_to_num(nxt["epsp_xy"], nan=0.0, posinf=0.0, neginf=0.0), min=-1.0, max=1.0)
-        solid = (nxt["phi"] >= 0.5).to(dtype=nxt["phi"].dtype)
+        # 连续相场门控，避免硬阈值在界面处引入数值跳变。
+        solid = smooth_heaviside(nxt["phi"], clamp_input=False)
         nxt["eta"] = nxt["eta"] * solid
         nxt["epspeq"] = nxt["epspeq"] * solid
         nxt["epsp_xx"] = nxt["epsp_xx"] * solid

@@ -1,0 +1,74 @@
+[
+  {
+    "name": "basal_1",
+    "family": "basal",
+    "s_crystal": [1.0, 0.0, 0.0],
+    "n_crystal": [0.0, 0.0, 1.0]
+  },
+  {
+    "name": "basal_2",
+    "family": "basal",
+    "s_crystal": [-0.5, 0.8660254, 0.0],
+    "n_crystal": [0.0, 0.0, 1.0]
+  },
+  {
+    "name": "basal_3",
+    "family": "basal",
+    "s_crystal": [-0.5, -0.8660254, 0.0],
+    "n_crystal": [0.0, 0.0, 1.0]
+  },
+  {
+    "name": "prismatic_1",
+    "family": "prismatic",
+    "s_crystal": [0.0, 1.0, 0.0],
+    "n_crystal": [1.0, 0.0, 0.0]
+  },
+  {
+    "name": "prismatic_2",
+    "family": "prismatic",
+    "s_crystal": [-0.8660254, -0.5, 0.0],
+    "n_crystal": [-0.5, 0.8660254, 0.0]
+  },
+  {
+    "name": "prismatic_3",
+    "family": "prismatic",
+    "s_crystal": [0.8660254, -0.5, 0.0],
+    "n_crystal": [-0.5, -0.8660254, 0.0]
+  },
+  {
+    "name": "pyramidal_1",
+    "family": "pyramidal",
+    "s_crystal": [0.7, 0.0, 0.714],
+    "n_crystal": [0.0, 0.917, -0.399]
+  },
+  {
+    "name": "pyramidal_2",
+    "family": "pyramidal",
+    "s_crystal": [0.35, 0.606, 0.714],
+    "n_crystal": [-0.794, 0.458, -0.399]
+  },
+  {
+    "name": "pyramidal_3",
+    "family": "pyramidal",
+    "s_crystal": [-0.35, 0.606, 0.714],
+    "n_crystal": [-0.794, -0.458, -0.399]
+  },
+  {
+    "name": "pyramidal_4",
+    "family": "pyramidal",
+    "s_crystal": [-0.7, 0.0, 0.714],
+    "n_crystal": [0.0, -0.917, -0.399]
+  },
+  {
+    "name": "pyramidal_5",
+    "family": "pyramidal",
+    "s_crystal": [-0.35, -0.606, 0.714],
+    "n_crystal": [0.794, -0.458, -0.399]
+  },
+  {
+    "name": "pyramidal_6",
+    "family": "pyramidal",
+    "s_crystal": [0.35, -0.606, 0.714],
+    "n_crystal": [0.794, 0.458, -0.399]
+  }
+]

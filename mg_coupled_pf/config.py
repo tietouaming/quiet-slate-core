@@ -215,7 +215,13 @@ class CrystalPlasticityConfig:
     twin_crss_scale: float = 0.85
     matrix_hardening_scale: float = 1.0
     twin_hardening_scale: float = 1.2
-    slip_systems_file: str = "configs/slip_systems_hcp_2d.json"
+    # 晶体取向（Bunge ZXZ 欧拉角，单位 degree）。
+    crystal_orientation_euler_deg: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    # 孪晶重取向：绕给定轴旋转一定角度（单位 degree）。
+    twin_reorientation_axis: List[float] = field(default_factory=lambda: [0.0, 0.0, 1.0])
+    twin_reorientation_angle_deg: float = 86.3
+    # 默认优先使用 3D 晶体学滑移系定义文件。
+    slip_systems_file: str = "configs/slip_systems_hcp_3d.json"
 
 
 @dataclass
@@ -240,6 +246,14 @@ class MechanicsConfig:
     max_abs_displacement_um: float = 0.0
     max_abs_strain: float = 0.1
     strict_solid_stress_only: bool = False
+    # 各向异性 HCP 弹性开关：开启后使用 Cij + 取向旋转，而非各向同性 lambda/mu。
+    use_anisotropic_hcp: bool = False
+    # 与 CP 保持一致的取向参数（Bunge ZXZ）。
+    crystal_orientation_euler_deg: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    twin_reorientation_axis: List[float] = field(default_factory=lambda: [0.0, 0.0, 1.0])
+    twin_reorientation_angle_deg: float = 86.3
+    # 是否根据 h(eta) 在母相/孪晶刚度之间插值。
+    anisotropic_blend_with_twin: bool = True
     # 力学离散算子的边界处理（与标量场边界分离）。
     mechanics_bc: str = "neumann"
     # 可选按轴边界条件：若非空则覆盖 mechanics_bc。
@@ -374,39 +388,36 @@ def _deep_update(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
     return dst
 
 
-def default_slip_systems_2d() -> List[Dict[str, Any]]:
-    """返回二维投影下的默认 HCP 滑移系集合。"""
+def default_slip_systems_hcp_3d() -> List[Dict[str, Any]]:
+    """返回 3D 晶体学定义的默认 HCP 滑移系集合（投影到 2D 使用）。"""
     systems: List[Dict[str, Any]] = []
-    # 3 basal <a>
-    for i, angle in enumerate([0.0, 60.0, 120.0], start=1):
-        systems.append(
-            {
-                "name": f"basal_{i}",
-                "family": "basal",
-                "direction_angle_deg": angle,
-                "normal_angle_deg": angle + 90.0,
-            }
-        )
-    # 3 prismatic <a>
-    for i, angle in enumerate([30.0, 90.0, 150.0], start=1):
-        systems.append(
-            {
-                "name": f"prismatic_{i}",
-                "family": "prismatic",
-                "direction_angle_deg": angle,
-                "normal_angle_deg": angle + 90.0,
-            }
-        )
-    # 6 pyramidal-II <a+c> projected to 2D
-    for i, angle in enumerate([15.0, 45.0, 75.0, 105.0, 135.0, 165.0], start=1):
-        systems.append(
-            {
-                "name": f"pyramidal_{i}",
-                "family": "pyramidal",
-                "direction_angle_deg": angle,
-                "normal_angle_deg": angle + 90.0,
-            }
-        )
+    # basal <a>，法向沿 c 轴。
+    basal_dirs = [
+        [1.0, 0.0, 0.0],
+        [-0.5, 0.8660254, 0.0],
+        [-0.5, -0.8660254, 0.0],
+    ]
+    for i, s in enumerate(basal_dirs, start=1):
+        systems.append({"name": f"basal_{i}", "family": "basal", "s_crystal": s, "n_crystal": [0.0, 0.0, 1.0]})
+    # prismatic <a>，棱柱面法向位于 basal 面内。
+    prismatic_defs = [
+        ([0.0, 1.0, 0.0], [1.0, 0.0, 0.0]),
+        ([-0.8660254, -0.5, 0.0], [-0.5, 0.8660254, 0.0]),
+        ([0.8660254, -0.5, 0.0], [-0.5, -0.8660254, 0.0]),
+    ]
+    for i, (s, n) in enumerate(prismatic_defs, start=1):
+        systems.append({"name": f"prismatic_{i}", "family": "prismatic", "s_crystal": s, "n_crystal": n})
+    # pyramidal <c+a>（简化 3D 定义，保持 s·n=0 且含 c 分量）。
+    pyramidal_defs = [
+        ([0.7, 0.0, 0.714], [0.0, 0.917, -0.399]),
+        ([0.35, 0.606, 0.714], [-0.794, 0.458, -0.399]),
+        ([-0.35, 0.606, 0.714], [-0.794, -0.458, -0.399]),
+        ([-0.7, 0.0, 0.714], [0.0, -0.917, -0.399]),
+        ([-0.35, -0.606, 0.714], [0.794, -0.458, -0.399]),
+        ([0.35, -0.606, 0.714], [0.794, 0.458, -0.399]),
+    ]
+    for i, (s, n) in enumerate(pyramidal_defs, start=1):
+        systems.append({"name": f"pyramidal_{i}", "family": "pyramidal", "s_crystal": s, "n_crystal": n})
     return systems
 
 
@@ -416,7 +427,7 @@ def _load_slip_systems(path: Path) -> List[Dict[str, Any]]:
         # 用户显式提供时，完全以外部文件为准。
         return json.loads(path.read_text(encoding="utf-8"))
     # 回退到内置默认滑移系，保证最小可运行。
-    return default_slip_systems_2d()
+    return default_slip_systems_hcp_3d()
 
 
 def load_config(config_path: str | Path | None = None) -> SimulationConfig:

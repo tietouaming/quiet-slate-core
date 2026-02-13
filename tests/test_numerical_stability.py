@@ -705,3 +705,41 @@ def test_cp_phase_dependent_strength_affects_plastic_rate() -> None:
     m_rate = float(torch.mean(out_m["epspeq_dot"]).item())
     t_rate = float(torch.mean(out_t["epspeq_dot"]).item())
     assert t_rate > m_rate
+
+
+def test_mechanics_anisotropic_hcp_stress_is_finite() -> None:
+    """开启 HCP 各向异性后，应力计算应保持有限值并返回完整分量。"""
+    cfg = load_config("configs/notch_case.yaml")
+    cfg.mechanics.use_anisotropic_hcp = True
+    cfg.mechanics.plane_strain = True
+    mech = MechanicsModel(cfg)
+    phi = torch.ones((1, 1, 5, 6), dtype=torch.float32)
+    ex = torch.full_like(phi, 0.006)
+    ey = torch.full_like(phi, -0.0015)
+    exy = torch.full_like(phi, 0.001)
+    eta = torch.zeros_like(phi)
+    sig = mech.constitutive_stress(phi, ex, ey, exy, eta=eta)
+    for k in ("sigma_xx", "sigma_yy", "sigma_xy", "sigma_zz", "sigma_h"):
+        assert torch.isfinite(sig[k]).all()
+
+
+def test_mechanics_anisotropic_twin_blend_changes_stress() -> None:
+    """各向异性+孪晶刚度混合开启时，eta 从 0->1 应改变应力响应。"""
+    cfg = load_config("configs/notch_case.yaml")
+    cfg.mechanics.use_anisotropic_hcp = True
+    cfg.mechanics.anisotropic_blend_with_twin = True
+    cfg.mechanics.crystal_orientation_euler_deg = [20.0, 25.0, 10.0]
+    # 避免绕 c 轴旋转导致 TI 刚度不变，测试时使用 x 轴重取向。
+    cfg.mechanics.twin_reorientation_axis = [1.0, 0.0, 0.0]
+    cfg.mechanics.twin_reorientation_angle_deg = 32.0
+    mech = MechanicsModel(cfg)
+    phi = torch.ones((1, 1, 5, 6), dtype=torch.float32)
+    ex = torch.full_like(phi, 0.004)
+    ey = torch.full_like(phi, -0.001)
+    exy = torch.full_like(phi, 0.002)
+    eta0 = torch.zeros_like(phi)
+    eta1 = torch.ones_like(phi)
+    s0 = mech.constitutive_stress(phi, ex, ey, exy, eta=eta0)
+    s1 = mech.constitutive_stress(phi, ex, ey, exy, eta=eta1)
+    delta = float(torch.mean(torch.abs(s1["sigma_xx"] - s0["sigma_xx"])).item())
+    assert delta > 1e-4
