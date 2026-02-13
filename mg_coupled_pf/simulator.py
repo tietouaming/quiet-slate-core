@@ -349,33 +349,14 @@ class CoupledSimulator:
 
     def _compute_mechanics_residual(self, mech_state: Dict[str, torch.Tensor], phi: torch.Tensor) -> float:
         """计算 `div(sigma)=0` 的离散残差均值（仅固相统计）。"""
-        bx = str(getattr(self.cfg.mechanics, "mechanics_bc_x", "")).strip().lower()
-        by = str(getattr(self.cfg.mechanics, "mechanics_bc_y", "")).strip().lower()
-        if bx or by:
-            if not bx:
-                bx = str(getattr(self.cfg.mechanics, "mechanics_bc", "neumann")).strip().lower()
-            if not by:
-                by = str(getattr(self.cfg.mechanics, "mechanics_bc", "neumann")).strip().lower()
-            bc = {"x": bx, "y": by}
-        else:
-            bc = str(getattr(self.cfg.mechanics, "mechanics_bc", "neumann")).strip().lower()
-        res_x = divergence(
+        res_x, res_y = self.mech.stress_divergence(
             mech_state["sigma_xx"],
-            mech_state["sigma_xy"],
-            self.dx_um,
-            self.dy_um,
-            x_coords=self.x_coords_um,
-            y_coords=self.y_coords_um,
-            bc=bc,
-        )
-        res_y = divergence(
-            mech_state["sigma_xy"],
             mech_state["sigma_yy"],
+            mech_state["sigma_xy"],
             self.dx_um,
             self.dy_um,
-            x_coords=self.x_coords_um,
-            y_coords=self.y_coords_um,
-            bc=bc,
+            x_coords_um=self.x_coords_um,
+            y_coords_um=self.y_coords_um,
         )
         solid = solid_indicator(phi, self.cfg.domain.solid_phase_threshold)
         return 0.5 * (
@@ -383,8 +364,18 @@ class CoupledSimulator:
             + self._masked_mean_abs(res_y, solid)
         )
 
-    def _compute_free_energy(self, state: Dict[str, torch.Tensor], mech_state: Dict[str, torch.Tensor]) -> float:
-        """计算离散总自由能密度（面积加权平均）。"""
+    def _compute_free_energy(
+        self,
+        state: Dict[str, torch.Tensor],
+        mech_state: Dict[str, torch.Tensor],
+        *,
+        for_gate: bool = False,
+    ) -> float:
+        """计算离散自由能（面积加权平均）。
+
+        - `for_gate=True`：返回 E_gate（仅包含与当前变分驱动一致的核心项）；
+        - `for_gate=False`：返回 E_diag（用于诊断展示，可含弹性能等扩展项）。
+        """
         bc = self._scalar_bc()
         phi = torch.clamp(state["phi"], 0.0, 1.0)
         cbar = torch.clamp(state["c"], self.cfg.corrosion.cMg_min, self.cfg.corrosion.cMg_max)
@@ -428,12 +419,23 @@ class CoupledSimulator:
         sigma_xy = mech_state["sigma_xy"]
         elastic = 0.5 * (sigma_xx * eps_xx + sigma_yy * eps_yy + 2.0 * sigma_xy * eps_xy)
         mech_phi_coupling = torch.zeros_like(phi)
-        if bool(self.cfg.corrosion.include_mech_term_in_phi_variation) and bool(
-            getattr(self.cfg.corrosion, "include_mech_term_in_free_energy", True)
-        ):
-            # 与 phi_nonlin 中的 -h'(phi)*e_mech 保持一致：自由能项取 -h(phi)*e_mech。
+        if bool(getattr(self.cfg.corrosion, "include_mech_term_in_free_energy", False)):
+            # 诊断项：-h(phi)*e_mech。仅在配置开启时计入。
             mech_phi_coupling = -hphi * self._mech_phi_coupling_energy_density(mech_state)
-        total = chem + phi_dw + grad_phi + eta_barrier + grad_eta + elastic + mech_phi_coupling
+        # E_gate：严格对应变分核心项；机械-phi 项仅在“方程+自由能”双开启时计入。
+        gate_total = chem + phi_dw + grad_phi + eta_barrier + grad_eta
+        if bool(self.cfg.corrosion.include_mech_term_in_phi_variation) and bool(
+            getattr(self.cfg.corrosion, "include_mech_term_in_free_energy", False)
+        ):
+            gate_total = gate_total + mech_phi_coupling
+        # E_diag：用于日志与可视化，不参与严格门控判据。
+        diag_total = gate_total + elastic
+        if bool(getattr(self.cfg.corrosion, "include_mech_term_in_free_energy", False)) and not bool(
+            self.cfg.corrosion.include_mech_term_in_phi_variation
+        ):
+            # 当用户仅想诊断机械耦合项时，允许其仅出现在 E_diag。
+            diag_total = diag_total + mech_phi_coupling
+        total = gate_total if for_gate else diag_total
         total = torch.nan_to_num(total, nan=0.0, posinf=0.0, neginf=0.0)
         return float(self._mean_field(total).item())
 
@@ -807,18 +809,41 @@ class CoupledSimulator:
     ) -> torch.Tensor:
         """扩散方程右端项。"""
         bc = self._scalar_bc()
-        # 主扩散项采用守恒 finite-volume 离散，减少边界伪通量与非对称误差。
-        diff_term = self._div_diffusive_fv(
-            c_field,
-            D,
-            dx=self.dx_m,
-            dy=self.dy_m,
-            x_coords=self.x_coords_m,
-            y_coords=self.y_coords_m,
-            bc=bc,
-        )
-        jx = -D * (corr * gx_phi)
-        jy = -D * (corr * gy_phi)
+        use_mu_form = bool(getattr(self.cfg.corrosion, "concentration_use_mu_form", True))
+        if use_mu_form:
+            # 与化学自由能一致的写法：
+            # mu = A*(c - h(phi)*(cs-cl) - cl),  c_t = div(M*grad(mu)), M = D/A。
+            hphi = smooth_heaviside(phi_for_state)
+            cl_eq = float(self.cfg.corrosion.c_l_eq_norm)
+            cs_eq = float(self.cfg.corrosion.c_s_eq_norm)
+            delta_eq = cs_eq - cl_eq
+            A_mpa = max(float(self.cfg.corrosion.A_J_m3) / 1e6, 1e-12)
+            mu = A_mpa * (c_field - hphi * delta_eq - cl_eq)
+            M = torch.clamp(D / A_mpa, min=0.0)
+            diff_term = self._div_diffusive_fv(
+                mu,
+                M,
+                dx=self.dx_m,
+                dy=self.dy_m,
+                x_coords=self.x_coords_m,
+                y_coords=self.y_coords_m,
+                bc=bc,
+            )
+            jx = torch.zeros_like(c_field)
+            jy = torch.zeros_like(c_field)
+        else:
+            # 旧形式（保留兼容）：div(D*grad(c)) - div(-D*corr*grad(phi))。
+            diff_term = self._div_diffusive_fv(
+                c_field,
+                D,
+                dx=self.dx_m,
+                dy=self.dy_m,
+                x_coords=self.x_coords_m,
+                y_coords=self.y_coords_m,
+                bc=bc,
+            )
+            jx = -D * (corr * gx_phi)
+            jy = -D * (corr * gy_phi)
         if self.couplers:
             state_tmp = dict(self.state if state_for_coupler is None else state_for_coupler)
             state_tmp["phi"] = phi_for_state
@@ -1353,16 +1378,20 @@ class CoupledSimulator:
                 return reject("pde_mech")
 
         energy_gate_enabled = bool(self.cfg.ml.enable_energy_gate)
-        if energy_gate_enabled and bool(self.cfg.corrosion.include_mech_term_in_phi_variation) and (
-            not bool(getattr(self.cfg.corrosion, "include_mech_term_in_free_energy", True))
+        use_variational_gate_energy = bool(getattr(self.cfg.ml, "energy_gate_use_variational_core", True))
+        if (
+            energy_gate_enabled
+            and (not use_variational_gate_energy)
+            and bool(self.cfg.corrosion.include_mech_term_in_phi_variation)
+            and (not bool(getattr(self.cfg.corrosion, "include_mech_term_in_free_energy", False)))
         ):
-            # 当机械-phi 驱动未写入自由能时，能量门控不再具有变分意义，自动跳过。
+            # 仅当用户要求以 E_diag 做门控且其与方程不一致时，自动跳过。
             energy_gate_enabled = False
             self.stats["ml_energy_gate_skipped_nonvariational"] += 1
 
         if energy_gate_enabled:
-            e_prev = self._compute_free_energy(prev, mech_prev)
-            e_nxt = self._compute_free_energy(nxt, mech_nxt)
+            e_prev = self._compute_free_energy(prev, mech_prev, for_gate=use_variational_gate_energy)
+            e_nxt = self._compute_free_energy(nxt, mech_nxt, for_gate=use_variational_gate_energy)
             self._last_gate_metrics["free_energy"] = float(e_nxt)
             dE = float(e_nxt - e_prev)
             dE_abs_max = max(float(self.cfg.ml.energy_abs_increase_max), 0.0)
@@ -1371,7 +1400,9 @@ class CoupledSimulator:
             if dE > dE_allow:
                 return reject("energy")
         else:
-            self._last_gate_metrics["free_energy"] = float(self._compute_free_energy(nxt, mech_nxt))
+            self._last_gate_metrics["free_energy"] = float(
+                self._compute_free_energy(nxt, mech_nxt, for_gate=use_variational_gate_energy)
+            )
         return True
 
     def _limit_surrogate_update(self, prev: Dict[str, torch.Tensor], nxt: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:

@@ -573,6 +573,7 @@ def test_energy_gate_auto_skips_when_nonvariational_mech_term_enabled() -> None:
     cfg.ml.residual_gate = 10.0
     cfg.ml.enable_pde_residual_gate = False
     cfg.ml.enable_energy_gate = True
+    cfg.ml.energy_gate_use_variational_core = False
     cfg.corrosion.include_mech_term_in_phi_variation = True
     cfg.corrosion.include_mech_term_in_free_energy = False
     sim = CoupledSimulator(cfg)
@@ -620,3 +621,64 @@ def test_mechanics_dirichlet_nonzero_right_value_enters_ux_gradient() -> None:
     right_mean = float(torch.mean(ex[:, :, :, -1]).item())
     assert interior_mean > 1e-4
     assert right_mean > 1e-4
+
+
+def test_diffusion_rhs_mu_form_matches_explicit_mu_divergence() -> None:
+    """化学势一致写法应等价于 `div(M*grad(mu))` 的显式实现。"""
+    cfg = load_config("configs/notch_case.yaml")
+    cfg.runtime.device = "cpu"
+    cfg.ml.enabled = False
+    cfg.domain.nx = 32
+    cfg.domain.ny = 24
+    sim = CoupledSimulator(cfg)
+    phi = torch.clamp(sim.state["phi"] * 0.85 + 0.1, 0.0, 1.0)
+    c = torch.clamp(sim.state["c"] * 0.9 + 0.02, cfg.corrosion.cMg_min, cfg.corrosion.cMg_max)
+    hphi = smooth_heaviside(phi)
+    hphi_d = smooth_heaviside_prime(phi)
+    D = cfg.corrosion.D_s_m2_s * hphi + (1.0 - hphi) * cfg.corrosion.D_l_m2_s
+    gx_phi, gy_phi = grad_xy(
+        phi,
+        sim.dx_m,
+        sim.dy_m,
+        x_coords=sim.x_coords_m,
+        y_coords=sim.y_coords_m,
+        bc=sim._scalar_bc(),
+    )
+    corr = hphi_d * (cfg.corrosion.c_l_eq_norm - cfg.corrosion.c_s_eq_norm)
+
+    cfg.corrosion.concentration_use_mu_form = True
+    rhs_mu = sim._diffusion_rhs(c, D, corr, gx_phi, gy_phi, phi)
+    A_mpa = cfg.corrosion.A_J_m3 / 1e6
+    mu = A_mpa * (c - hphi * (cfg.corrosion.c_s_eq_norm - cfg.corrosion.c_l_eq_norm) - cfg.corrosion.c_l_eq_norm)
+    M = D / max(A_mpa, 1e-12)
+    rhs_ref = sim._div_diffusive_fv(
+        mu,
+        M,
+        dx=sim.dx_m,
+        dy=sim.dy_m,
+        x_coords=sim.x_coords_m,
+        y_coords=sim.y_coords_m,
+        bc=sim._scalar_bc(),
+    )
+    err = float(torch.max(torch.abs(rhs_mu - rhs_ref)).item())
+    assert err < 1e-8
+
+
+def test_mechanics_stress_divergence_uses_traction_free_on_neumann_boundaries() -> None:
+    """Neumann 轴上应按 traction-free 处理边界面通量。"""
+    cfg = load_config("configs/notch_case.yaml")
+    cfg.mechanics.mechanics_bc = "neumann"
+    mech = MechanicsModel(cfg)
+    h, w = 12, 18
+    sxx = torch.ones((1, 1, h, w), dtype=torch.float32)
+    syy = torch.zeros_like(sxx)
+    sxy = torch.zeros_like(sxx)
+    div_x, div_y = mech.stress_divergence(sxx, syy, sxy, dx_um=1.0, dy_um=1.0)
+    # 常值 sigma_xx 在 traction-free x 边界下，内部散度为 0，边界两列出现符号相反的通量跳变。
+    interior = float(torch.max(torch.abs(div_x[:, :, :, 1:-1])).item())
+    left = float(torch.mean(div_x[:, :, :, 0]).item())
+    right = float(torch.mean(div_x[:, :, :, -1]).item())
+    assert interior < 1e-6
+    assert left > 0.5
+    assert right < -0.5
+    assert float(torch.max(torch.abs(div_y)).item()) < 1e-6

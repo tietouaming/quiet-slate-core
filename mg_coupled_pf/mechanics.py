@@ -13,7 +13,7 @@ from typing import Dict, List, Tuple
 import torch
 
 from .config import SimulationConfig
-from .operators import divergence, grad_xy, smooth_heaviside, solid_indicator
+from .operators import grad_xy, smooth_heaviside, solid_indicator
 
 
 class MechanicsModel:
@@ -62,6 +62,16 @@ class MechanicsModel:
     def _use_dirichlet_x(self) -> bool:
         """是否采用 x 向位移边界加载。"""
         return self._loading_mode() in {"dirichlet_x", "dirichlet", "ux_dirichlet"}
+
+    def _mech_bc_axes(self) -> Tuple[str, str]:
+        """返回按轴拆分后的力学边界条件 `(bc_x, bc_y)`。"""
+        bc = self._mech_bc()
+        if isinstance(bc, dict):
+            bx = str(bc.get("x", "neumann")).strip().lower()
+            by = str(bc.get("y", "neumann")).strip().lower()
+            return bx, by
+        b = str(bc).strip().lower()
+        return b, b
 
     def _macro_external_strain_x(self) -> float:
         """返回宏观外加应变项（仅本征应变加载模式生效）。"""
@@ -124,6 +134,173 @@ class MechanicsModel:
             vx[:, :, :, -1] = 0.0
         vy[:, :, 0, 0] = 0.0
         return vx, vy
+
+    def _axis_metrics(
+        self,
+        n: int,
+        d_default: float,
+        coords: torch.Tensor | None,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """构造控制体宽度。"""
+        if n <= 1:
+            return torch.full((1,), max(float(d_default), 1e-12), device=device, dtype=dtype)
+        if coords is None:
+            return torch.full((n,), max(float(d_default), 1e-12), device=device, dtype=dtype)
+        dv = torch.clamp(coords[1:] - coords[:-1], min=1e-12).to(device=device, dtype=dtype)
+        out = torch.zeros((n,), device=device, dtype=dtype)
+        out[0] = 0.5 * dv[0]
+        out[-1] = 0.5 * dv[-1]
+        if n > 2:
+            out[1:-1] = 0.5 * (dv[1:] + dv[:-1])
+        return out
+
+    def _face_grad_x(
+        self,
+        f: torch.Tensor,
+        *,
+        bc_x: str,
+        dx_um: float,
+        x_coords_um: torch.Tensor | None,
+        left_face_value: float | None = None,
+        right_face_value: float | None = None,
+    ) -> torch.Tensor:
+        """按 x 向面通量差分计算 `∂f/∂x`（FV 形式）。"""
+        eps = 1e-12
+        if bc_x in {"periodic", "circular"}:
+            # 周期边界仅在均匀网格下使用，避免非均匀周期带来的面距歧义。
+            dx = max(float(dx_um), eps)
+            f_ip12 = 0.5 * (f + torch.roll(f, shifts=-1, dims=3))
+            return (f_ip12 - torch.roll(f_ip12, shifts=1, dims=3)) / dx
+
+        w = f.shape[-1]
+        cw = self._axis_metrics(w, dx_um, x_coords_um, dtype=f.dtype, device=f.device).view(1, 1, 1, -1)
+        left = torch.zeros_like(f[:, :, :, :1])
+        right = torch.zeros_like(f[:, :, :, :1])
+        if left_face_value is None:
+            left = f[:, :, :, :1]
+        else:
+            left.fill_(float(left_face_value))
+        if right_face_value is None:
+            right = f[:, :, :, -1:]
+        else:
+            right.fill_(float(right_face_value))
+        interior = 0.5 * (f[:, :, :, 1:] + f[:, :, :, :-1])
+        faces = torch.cat([left, interior, right], dim=3)  # [B,C,H,W+1]
+        return (faces[:, :, :, 1:] - faces[:, :, :, :-1]) / torch.clamp(cw, min=eps)
+
+    def _face_grad_y(
+        self,
+        f: torch.Tensor,
+        *,
+        bc_y: str,
+        dy_um: float,
+        y_coords_um: torch.Tensor | None,
+        bottom_face_value: float | None = None,
+        top_face_value: float | None = None,
+    ) -> torch.Tensor:
+        """按 y 向面通量差分计算 `∂f/∂y`（FV 形式）。"""
+        eps = 1e-12
+        if bc_y in {"periodic", "circular"}:
+            dy = max(float(dy_um), eps)
+            f_jp12 = 0.5 * (f + torch.roll(f, shifts=-1, dims=2))
+            return (f_jp12 - torch.roll(f_jp12, shifts=1, dims=2)) / dy
+
+        h = f.shape[-2]
+        ch = self._axis_metrics(h, dy_um, y_coords_um, dtype=f.dtype, device=f.device).view(1, 1, -1, 1)
+        bottom = torch.zeros_like(f[:, :, :1, :])
+        top = torch.zeros_like(f[:, :, :1, :])
+        if bottom_face_value is None:
+            bottom = f[:, :, :1, :]
+        else:
+            bottom.fill_(float(bottom_face_value))
+        if top_face_value is None:
+            top = f[:, :, -1:, :]
+        else:
+            top.fill_(float(top_face_value))
+        interior = 0.5 * (f[:, :, 1:, :] + f[:, :, :-1, :])
+        faces = torch.cat([bottom, interior, top], dim=2)  # [B,C,H+1,W]
+        return (faces[:, :, 1:, :] - faces[:, :, :-1, :]) / torch.clamp(ch, min=eps)
+
+    def _stress_divergence(
+        self,
+        sigma_xx: torch.Tensor,
+        sigma_yy: torch.Tensor,
+        sigma_xy: torch.Tensor,
+        dx_um: float,
+        dy_um: float,
+        *,
+        x_coords_um: torch.Tensor | None = None,
+        y_coords_um: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """计算 `div(sigma)`，在 Neumann 轴上按 traction-free 处理边界面应力。"""
+        bx, by = self._mech_bc_axes()
+        # x 动量方程：∂x(sxx) + ∂y(sxy) = 0
+        # y 动量方程：∂x(sxy) + ∂y(syy) = 0
+        tx_left = 0.0 if bx == "neumann" else None
+        tx_right = 0.0 if bx == "neumann" else None
+        ty_bottom = 0.0 if by == "neumann" else None
+        ty_top = 0.0 if by == "neumann" else None
+
+        d_sxx_dx = self._face_grad_x(
+            sigma_xx,
+            bc_x=bx,
+            dx_um=dx_um,
+            x_coords_um=x_coords_um,
+            left_face_value=tx_left,
+            right_face_value=tx_right,
+        )
+        d_sxy_dy = self._face_grad_y(
+            sigma_xy,
+            bc_y=by,
+            dy_um=dy_um,
+            y_coords_um=y_coords_um,
+            bottom_face_value=ty_bottom,
+            top_face_value=ty_top,
+        )
+        d_sxy_dx = self._face_grad_x(
+            sigma_xy,
+            bc_x=bx,
+            dx_um=dx_um,
+            x_coords_um=x_coords_um,
+            left_face_value=tx_left,
+            right_face_value=tx_right,
+        )
+        d_syy_dy = self._face_grad_y(
+            sigma_yy,
+            bc_y=by,
+            dy_um=dy_um,
+            y_coords_um=y_coords_um,
+            bottom_face_value=ty_bottom,
+            top_face_value=ty_top,
+        )
+        div_x = torch.nan_to_num(d_sxx_dx + d_sxy_dy, nan=0.0, posinf=0.0, neginf=0.0)
+        div_y = torch.nan_to_num(d_sxy_dx + d_syy_dy, nan=0.0, posinf=0.0, neginf=0.0)
+        return div_x, div_y
+
+    def stress_divergence(
+        self,
+        sigma_xx: torch.Tensor,
+        sigma_yy: torch.Tensor,
+        sigma_xy: torch.Tensor,
+        dx_um: float,
+        dy_um: float,
+        *,
+        x_coords_um: torch.Tensor | None = None,
+        y_coords_um: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """对外暴露的力学散度接口（用于残差门控等诊断）。"""
+        return self._stress_divergence(
+            sigma_xx,
+            sigma_yy,
+            sigma_xy,
+            dx_um,
+            dy_um,
+            x_coords_um=x_coords_um,
+            y_coords_um=y_coords_um,
+        )
 
     def _disp_strain_only(
         self,
@@ -229,7 +406,6 @@ class MechanicsModel:
         y_coords_um: torch.Tensor | None = None,
     ):
         """构造矩阵自由线性算子 A(u)=b（固定 eta/epsp/phi 的单步问题）。"""
-        bc = self._mech_bc()
         eta = state["eta"]
         phi = state["phi"]
         eps_tw = self.twin_strain(eta)
@@ -238,24 +414,17 @@ class MechanicsModel:
         ey0 = -epsp["eyy"] - eps_tw["eyy"]
         exy0 = -epsp["exy"] - eps_tw["exy"]
         sig0 = self.constitutive_stress(phi, ex0, ey0, exy0)
-        b_x = -divergence(
+        div0_x, div0_y = self._stress_divergence(
             sig0["sigma_xx"],
-            sig0["sigma_xy"],
-            dx_um,
-            dy_um,
-            x_coords=x_coords_um,
-            y_coords=y_coords_um,
-            bc=bc,
-        )
-        b_y = -divergence(
-            sig0["sigma_xy"],
             sig0["sigma_yy"],
+            sig0["sigma_xy"],
             dx_um,
             dy_um,
-            x_coords=x_coords_um,
-            y_coords=y_coords_um,
-            bc=bc,
+            x_coords_um=x_coords_um,
+            y_coords_um=y_coords_um,
         )
+        b_x = -div0_x
+        b_y = -div0_y
         b_x = torch.nan_to_num(b_x, nan=0.0, posinf=0.0, neginf=0.0)
         b_y = torch.nan_to_num(b_y, nan=0.0, posinf=0.0, neginf=0.0)
         b_x, b_y = self._apply_vector_constraints(b_x, b_y)
@@ -270,23 +439,14 @@ class MechanicsModel:
                 y_coords_um=y_coords_um,
             )
             sig_u = self.constitutive_stress(phi, eps_u["eps_xx"], eps_u["eps_yy"], eps_u["eps_xy"])
-            ax = divergence(
+            ax, ay = self._stress_divergence(
                 sig_u["sigma_xx"],
-                sig_u["sigma_xy"],
-                dx_um,
-                dy_um,
-                x_coords=x_coords_um,
-                y_coords=y_coords_um,
-                bc=bc,
-            )
-            ay = divergence(
-                sig_u["sigma_xy"],
                 sig_u["sigma_yy"],
+                sig_u["sigma_xy"],
                 dx_um,
                 dy_um,
-                x_coords=x_coords_um,
-                y_coords=y_coords_um,
-                bc=bc,
+                x_coords_um=x_coords_um,
+                y_coords_um=y_coords_um,
             )
             ax = torch.nan_to_num(ax, nan=0.0, posinf=0.0, neginf=0.0)
             ay = torch.nan_to_num(ay, nan=0.0, posinf=0.0, neginf=0.0)
@@ -566,7 +726,6 @@ class MechanicsModel:
         uy0: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """阻尼残差松弛（旧求解器，作为稳健回退）。"""
-        bc = self._mech_bc()
         ux = state["ux"] if ux0 is None else ux0
         uy = state["uy"] if uy0 is None else uy0
         eta = state["eta"]
@@ -601,23 +760,14 @@ class MechanicsModel:
                 y_coords_um=y_coords_um,
             )
             sig = self.constitutive_stress(phi, eps["eps_xx"], eps["eps_yy"], eps["eps_xy"])
-            div_x = divergence(
+            div_x, div_y = self._stress_divergence(
                 sig["sigma_xx"],
-                sig["sigma_xy"],
-                dx_um,
-                dy_um,
-                x_coords=x_coords_um,
-                y_coords=y_coords_um,
-                bc=bc,
-            )
-            div_y = divergence(
-                sig["sigma_xy"],
                 sig["sigma_yy"],
+                sig["sigma_xy"],
                 dx_um,
                 dy_um,
-                x_coords=x_coords_um,
-                y_coords=y_coords_um,
-                bc=bc,
+                x_coords_um=x_coords_um,
+                y_coords_um=y_coords_um,
             )
             div_x = torch.nan_to_num(div_x, nan=0.0, posinf=0.0, neginf=0.0)
             div_y = torch.nan_to_num(div_y, nan=0.0, posinf=0.0, neginf=0.0)

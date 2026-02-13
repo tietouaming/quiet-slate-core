@@ -27,6 +27,7 @@ Kovacevic 论文中对腐蚀相场方程采用了：
 建议：
 
 - 默认采用上述 **mobility-only** 路径（当前代码就是这样）；
+- 对应实现中 `include_mech_term_in_free_energy` 默认设为 `false`，避免 energy gate 与演化方程不一致；
 - 仅当你明确希望“严格全变分”时，再开启 `include_mech_term_in_phi_variation: true`。
 
 ## 3. 晶体塑性-孪晶部分的二维化假设

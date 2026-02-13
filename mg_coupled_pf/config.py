@@ -161,7 +161,12 @@ class CorrosionConfig:
     include_twin_grad_term_in_phi_variation: bool = False
     # 若启用 include_mech_term_in_phi_variation，则在自由能中加入一致的 -h(phi)*e_mech 近似项，
     # 使 energy gate 与 PDE 演化目标保持一致。
-    include_mech_term_in_free_energy: bool = True
+    # 默认关闭，保持 mobility-only 路线与门控逻辑自洽。
+    include_mech_term_in_free_energy: bool = False
+    # c 方程是否使用“化学势一致”写法：
+    # mu = A_mpa * (c - h(phi)*(cs-cl) - cl)，c_t = div(M*grad(mu))，其中 M = D / A_mpa。
+    # 该写法与 chem 能量项保持同一尺度。
+    concentration_use_mu_form: bool = True
 
 
 @dataclass
@@ -267,6 +272,9 @@ class MLConfig:
     pde_residual_mech_abs_max: float = 5e1
     # 能量门控：限制“无外功项下的离散总能量”异常上升。
     enable_energy_gate: bool = True
+    # `true` 时，energy gate 使用严格与当前演化方程匹配的 E_gate（变分核心项）；
+    # `false` 时使用诊断总能量 E_diag（含弹性能等诊断项）。
+    energy_gate_use_variational_core: bool = True
     energy_abs_increase_max: float = 5e-2
     energy_rel_increase_max: float = 2e-3
     # 不确定性门控：通过输入微扰多次推理估计 surrogate 局部敏感度。
