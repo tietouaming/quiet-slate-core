@@ -23,6 +23,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from mg_coupled_pf import load_config
+from mg_coupled_pf.ml.scaling import build_mechanics_field_scales
 from mg_coupled_pf.ml.mech_warmstart import (
     MECH_INPUT_ORDER,
     build_mechanics_warmstart,
@@ -76,6 +77,12 @@ def _load_npz(path: Path) -> Tuple[torch.Tensor, torch.Tensor]:
     return x, y
 
 
+def _scale_tensor(order: List[str], scales: dict[str, float], device: torch.device) -> torch.Tensor:
+    """构造 [1,C,1,1] 通道尺度。"""
+    vals = [float(scales.get(k, 1.0)) for k in order]
+    return torch.tensor(vals, dtype=torch.float32, device=device).view(1, len(order), 1, 1)
+
+
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
@@ -104,12 +111,17 @@ def main() -> None:
         x_val, y_val = x_all[:0], y_all[:0]
 
     device = _pick_device(args.device)
+    input_scales, output_scales = build_mechanics_field_scales(cfg)
+    in_scale_vec = _scale_tensor(MECH_INPUT_ORDER, input_scales, device)
+    out_scale_vec = _scale_tensor(["ux", "uy"], output_scales, device)
     predictor = build_mechanics_warmstart(
         device=device,
         hidden=int(getattr(cfg.ml, "mechanics_warmstart_hidden", 24)),
         add_coord_features=bool(getattr(cfg.ml, "mechanics_warmstart_add_coord_features", True)),
         use_torch_compile=(not args.disable_torch_compile) and device.type == "cuda",
         channels_last=args.channels_last and device.type == "cuda",
+        input_scales=input_scales,
+        output_scales=output_scales,
     )
     model = predictor.model
     opt = torch.optim.Adam(model.parameters(), lr=float(args.lr))
@@ -135,7 +147,7 @@ def main() -> None:
             xb = x_train[idx].to(device, non_blocking=True)
             yb = y_train[idx].to(device, non_blocking=True)
             opt.zero_grad(set_to_none=True)
-            pred = model(xb)
+            pred = model(xb / in_scale_vec) * out_scale_vec
             loss_data = F.mse_loss(pred, yb)
             # 边界约束正则：确保网络学到“可用初值”而非任意位移场。
             ux = pred[:, 0:1]
@@ -156,7 +168,7 @@ def main() -> None:
         model.eval()
         with torch.no_grad():
             if x_val.shape[0] > 0:
-                pv = model(x_val.to(device))
+                pv = model(x_val.to(device) / in_scale_vec) * out_scale_vec
                 val_loss = float(F.mse_loss(pv, y_val.to(device)).item())
             else:
                 val_loss = train_loss
@@ -181,6 +193,8 @@ def main() -> None:
                 "best_val": float(best_val),
                 "model_path": str(out.resolve()),
                 "device": str(device),
+                "input_scales": {k: float(v) for k, v in input_scales.items()},
+                "output_scales": {k: float(v) for k, v in output_scales.items()},
             },
             ensure_ascii=False,
             indent=2,

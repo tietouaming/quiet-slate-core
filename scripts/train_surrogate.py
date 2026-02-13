@@ -26,6 +26,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from mg_coupled_pf import load_config
+from mg_coupled_pf.ml.scaling import build_surrogate_field_scales
 from mg_coupled_pf.ml.surrogate import FIELD_ORDER, arch_requires_full_precision, build_surrogate, save_surrogate
 
 
@@ -378,6 +379,12 @@ def _physics_losses(
     return loss, scalars
 
 
+def _channel_scale_tensor(field_scales: Dict[str, float], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """按 FIELD_ORDER 构造 [1,C,1,1] 通道尺度张量。"""
+    vals = [float(field_scales.get(k, 1.0)) for k in FIELD_ORDER]
+    return torch.tensor(vals, device=device, dtype=dtype).view(1, len(FIELD_ORDER), 1, 1)
+
+
 def main() -> None:
     """训练入口：数据准备、模型训练、验证与保存。"""
     args = parse_args()
@@ -452,6 +459,8 @@ def main() -> None:
     if arch_requires_full_precision(cfg.ml.model_arch):
         # Current CUDA complex FFT path used by FNO spectral conv does not support ComplexHalf reliably.
         use_amp = False
+    field_scales = build_surrogate_field_scales(cfg)
+    scale_vec = _channel_scale_tensor(field_scales, device=device, dtype=torch.float32)
 
     # 3) 构建 surrogate 模型与优化器。
     predictor = build_surrogate(
@@ -471,6 +480,7 @@ def main() -> None:
         afno_modes_y=cfg.ml.afno_modes_y,
         afno_depth=cfg.ml.afno_depth,
         afno_expansion=cfg.ml.afno_expansion,
+        field_scales=field_scales,
     )
     model = predictor.model
     use_channels_last = args.channels_last and device.type == "cuda"
@@ -539,10 +549,11 @@ def main() -> None:
                 optimizer.zero_grad(set_to_none=True)
                 # autocast 仅在 CUDA + 允许 AMP 时启用。
                 with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-                    pred_d = model(xb)
+                    xb_s = xb / scale_vec
+                    pred_d = model(xb_s) * scale_vec
                     roll_pred = None
                     if rollout_steps >= 2 and rollout_weight > 0.0:
-                        roll_pred = model(xb + pred_d)
+                        roll_pred = model((xb + pred_d) / scale_vec) * scale_vec
                     loss, comp = _physics_losses(
                         xb,
                         pred_d,
@@ -583,10 +594,11 @@ def main() -> None:
                     db2 = db2.contiguous(memory_format=torch.channels_last)
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-                    pred_d = model(xb)
+                    xb_s = xb / scale_vec
+                    pred_d = model(xb_s) * scale_vec
                     roll_pred = None
                     if rollout_steps >= 2 and rollout_weight > 0.0:
-                        roll_pred = model(xb + pred_d)
+                        roll_pred = model((xb + pred_d) / scale_vec) * scale_vec
                     loss, comp = _physics_losses(
                         xb,
                         pred_d,
@@ -633,10 +645,10 @@ def main() -> None:
                             xb = xb.contiguous(memory_format=torch.channels_last)
                             db = db.contiguous(memory_format=torch.channels_last)
                             db2 = db2.contiguous(memory_format=torch.channels_last)
-                        val_pred_d = model(xb)
+                        val_pred_d = model(xb / scale_vec) * scale_vec
                         roll_pred = None
                         if rollout_steps >= 2 and rollout_weight > 0.0:
-                            roll_pred = model(xb + val_pred_d)
+                            roll_pred = model((xb + val_pred_d) / scale_vec) * scale_vec
                         l_t, comp = _physics_losses(
                             xb,
                             val_pred_d,
@@ -670,10 +682,10 @@ def main() -> None:
                         xb = xb.contiguous(memory_format=torch.channels_last)
                         db = db.contiguous(memory_format=torch.channels_last)
                         db2 = db2.contiguous(memory_format=torch.channels_last)
-                    val_pred_d = model(xb)
+                    val_pred_d = model(xb / scale_vec) * scale_vec
                     roll_pred = None
                     if rollout_steps >= 2 and rollout_weight > 0.0:
-                        roll_pred = model(xb + val_pred_d)
+                        roll_pred = model((xb + val_pred_d) / scale_vec) * scale_vec
                     v_t, vcomp = _physics_losses(
                         xb,
                         val_pred_d,
@@ -745,6 +757,7 @@ def main() -> None:
                     "afno_modes_y": int(cfg.ml.afno_modes_y),
                     "afno_depth": int(cfg.ml.afno_depth),
                     "afno_expansion": float(cfg.ml.afno_expansion),
+                    "field_scales": {k: float(v) for k, v in field_scales.items()},
                 },
                 "device": str(device),
                 "streaming": bool(args.streaming),

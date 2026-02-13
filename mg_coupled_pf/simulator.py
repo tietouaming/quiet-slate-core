@@ -25,6 +25,7 @@ from .crystal_plasticity import CrystalPlasticityModel
 from .geometry import Grid2D, initial_fields, make_grid, pitting_mobility_field
 from .io_utils import ensure_dir, render_fields, render_final_clouds, render_grid_figure, save_history_csv, save_snapshot_npz
 from .mechanics import MechanicsModel
+from .ml.scaling import build_mechanics_field_scales, build_surrogate_field_scales
 from .ml.mech_warmstart import load_mechanics_warmstart
 from .ml.surrogate import load_surrogate
 from .operators import (
@@ -116,6 +117,8 @@ class CoupledSimulator:
         self.cp_state = self.cp.init_state(cfg.domain.ny, cfg.domain.nx)
         self.mech = MechanicsModel(cfg)
         self.pitting_field = pitting_mobility_field(cfg, self.grid)
+        self.surrogate_field_scales = build_surrogate_field_scales(cfg)
+        self.mech_input_scales, self.mech_output_scales = build_mechanics_field_scales(cfg)
 
         z = torch.zeros_like(self.state["phi"])
         # 塑性张量内部表示与 state 通道保持同步，便于 surrogate 与物理步共享。
@@ -127,6 +130,7 @@ class CoupledSimulator:
         self.state["epsp_xx"] = self.epsp["exx"].clone()
         self.state["epsp_yy"] = self.epsp["eyy"].clone()
         self.state["epsp_xy"] = self.epsp["exy"].clone()
+        self.state["epspeq_dot"] = torch.zeros_like(self.state["phi"])
         self.last_mech = {
             "sigma_xx": z.clone(),
             "sigma_yy": z.clone(),
@@ -160,6 +164,7 @@ class CoupledSimulator:
                         "afno_expansion": cfg.ml.afno_expansion,
                         "add_coord_features": cfg.ml.surrogate_add_coord_features,
                     },
+                    fallback_field_scales=self.surrogate_field_scales,
                 )
                 self.surrogate.enforce_displacement_constraints = bool(
                     getattr(cfg.ml, "surrogate_enforce_displacement_projection", True)
@@ -177,6 +182,8 @@ class CoupledSimulator:
                     fallback_add_coord_features=bool(getattr(cfg.ml, "mechanics_warmstart_add_coord_features", True)),
                     use_torch_compile=cfg.numerics.use_torch_compile and self.device.type == "cuda",
                     channels_last=self.device.type == "cuda",
+                    fallback_input_scales=self.mech_input_scales,
+                    fallback_output_scales=self.mech_output_scales,
                 )
         self._surrogate_reject_streak = 0
         self._surrogate_pause_until_step = 0
@@ -531,7 +538,6 @@ class CoupledSimulator:
         r_c = (cbar - prev["c"]) / dt - rhs_c
         pde_c_raw = self._masked_mean_abs(r_c)
 
-        heta = smooth_heaviside(eta, clamp_input=False)
         heta_d = smooth_heaviside_prime(eta, clamp_input=False)
         if self.cfg.twinning.scale_twin_gradient_by_hphi:
             grad_coef_eta = self.cfg.twinning.kappa_eta * hphi
@@ -659,6 +665,11 @@ class CoupledSimulator:
         )
         self.cp_state["g"] = cp_out["g"]
         self.cp_state["gamma_accum"] = cp_out["gamma_accum"]
+        self.state["epspeq_dot"] = torch.clamp(
+            torch.nan_to_num(cp_out["epspeq_dot"], nan=0.0, posinf=0.0, neginf=0.0),
+            min=0.0,
+            max=1e6,
+        )
         # surrogate 已经给出塑性场时，不在此重复积分 epsp_dot，仅同步内部缓存。
         self.epsp = self._epsp_from_state(self.state)
         self._sync_epsp_to_state()
@@ -1209,21 +1220,33 @@ class CoupledSimulator:
             # 代码中化学势/能量以 MPa 为标度，若输入 SI(1/Pa/s) 需转为 1/(MPa*s)。
             L0 = L0 * 1e6
         sigma_h_pa = mech_state["sigma_h"] * 1e6
-        mech_fac = (st["epspeq"] / max(c.yield_strain_for_mech, 1e-12) + 1.0) * torch.exp(
+        # 机械放大项默认采用“塑性应变率”而非“累计塑性应变”，避免历史量永久放大腐蚀速度。
+        if bool(getattr(c, "use_epspeq_rate_for_mobility", True)):
+            epsdot = torch.clamp(
+                torch.nan_to_num(st.get("epspeq_dot", torch.zeros_like(st["phi"])), nan=0.0, posinf=0.0, neginf=0.0),
+                min=0.0,
+            )
+            epsdot_ref = max(float(getattr(c, "epspeq_dot_ref_s_inv", 1e-3)), 1e-12)
+            k_epsdot = max(float(getattr(c, "k_epsdot", 1.0)), 0.0)
+            strain_fac = 1.0 + k_epsdot * torch.tanh(epsdot / epsdot_ref)
+        else:
+            strain_fac = st["epspeq"] / max(c.yield_strain_for_mech, 1e-12) + 1.0
+        stress_fac = torch.exp(
             torch.clamp(sigma_h_pa * c.molar_volume_m3_mol / (c.gas_constant_J_mol_K * c.temperature_K), -12.0, 12.0)
         )
+        mech_fac = strain_fac * stress_fac
         out = L0 * self.pitting_field * mech_fac
         for cp in self.couplers:
             out = out * cp.corrosion_mobility_multiplier(st, mech_state)
         return out
 
     def _mech_phi_coupling_energy_density(self, mech_state: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """与 phi 变分耦合一致的机械能近似密度 e_mech。"""
+        """与自由能一致的弹性能密度 e_mech = 0.5*sigma:epsilon。"""
         return 0.5 * (
-            mech_state["sigma_xx"] * mech_state["sigma_xx"]
-            + mech_state["sigma_yy"] * mech_state["sigma_yy"]
-            + 2.0 * mech_state["sigma_xy"] * mech_state["sigma_xy"]
-        ) / max(self.cfg.mechanics.mu_GPa * 1e3, 1e-9)
+            mech_state["sigma_xx"] * mech_state["eps_xx"]
+            + mech_state["sigma_yy"] * mech_state["eps_yy"]
+            + 2.0 * mech_state["sigma_xy"] * mech_state["eps_xy"]
+        )
 
     def _select_phi_imex_l0(self, L_phi_pos: torch.Tensor) -> float:
         """选择 phi-IMEX 的常数 L0（用于常系数隐式+显式补偿分裂）。"""
@@ -1286,6 +1309,11 @@ class CoupledSimulator:
             1e6,
         )
         self.state["epspeq"] = self.state["epspeq"] * solid
+        self.state["epspeq_dot"] = torch.clamp(
+            torch.nan_to_num(self.state.get("epspeq_dot", torch.zeros_like(self.state["phi"])), nan=0.0, posinf=0.0, neginf=0.0),
+            0.0,
+            1e6,
+        ) * solid
         self.state["epsp_xx"] = torch.clamp(
             torch.nan_to_num(self.state.get("epsp_xx", self.epsp["exx"]), nan=0.0, posinf=0.0, neginf=0.0),
             min=-1.0,
@@ -1609,6 +1637,11 @@ class CoupledSimulator:
             self.epsp["eyy"] = self.epsp["eyy"] + dt_s * cp_out["epsp_dot_yy"]
             self.epsp["exy"] = self.epsp["exy"] + dt_s * cp_out["epsp_dot_xy"]
             self.state["epspeq"] = self.state["epspeq"] + dt_s * cp_out["epspeq_dot"]
+            self.state["epspeq_dot"] = torch.clamp(
+                torch.nan_to_num(cp_out["epspeq_dot"], nan=0.0, posinf=0.0, neginf=0.0),
+                min=0.0,
+                max=1e6,
+            )
             self.epsp["exx"] = torch.clamp(torch.nan_to_num(self.epsp["exx"], nan=0.0, posinf=0.0, neginf=0.0), min=-1.0, max=1.0)
             self.epsp["eyy"] = torch.clamp(torch.nan_to_num(self.epsp["eyy"], nan=0.0, posinf=0.0, neginf=0.0), min=-1.0, max=1.0)
             self.epsp["exy"] = torch.clamp(torch.nan_to_num(self.epsp["exy"], nan=0.0, posinf=0.0, neginf=0.0), min=-1.0, max=1.0)
@@ -1644,6 +1677,9 @@ class CoupledSimulator:
                 self.stats["mech_correct_skipped_elastic"] += 1
             self._last_mech_phi = self.state["phi"].clone()
             self._last_mech_eta = self.state["eta"].clone()
+        else:
+            # 非力学更新步视为准静态保持，塑性应变率设为 0，避免历史量持续驱动腐蚀。
+            self.state["epspeq_dot"] = torch.zeros_like(self.state["phi"])
 
         # 无论力学本步是否更新，都保持 state 与内部塑性张量同步。
         self._sync_epsp_to_state()
@@ -1763,7 +1799,6 @@ class CoupledSimulator:
             self.stats["mass_projection_applied"] += 1
 
         # 孪晶 TDGL 方程推进。
-        heta = smooth_heaviside(eta)
         heta_d = smooth_heaviside_prime(eta)
         # TDGL 与固液界面耦合应使用最新 phi，避免“先错算再投影”。
         hphi_eta = smooth_heaviside(phi_new)
@@ -1883,6 +1918,8 @@ class CoupledSimulator:
                             self.state = pred
                             self.epsp = self._epsp_from_state(self.state)
                             self._sync_epsp_to_state()
+                            if not bool(getattr(self.cfg.ml, "surrogate_update_plastic_fields", False)):
+                                self.state["epspeq_dot"] = torch.zeros_like(self.state["phi"])
                             if self.cfg.ml.enable_surrogate_mechanics_correction:
                                 # 可选：对 surrogate 状态再做一次力学校正。
                                 self.last_mech = gate_mech if gate_mech is not None else self.mech.solve_quasi_static(

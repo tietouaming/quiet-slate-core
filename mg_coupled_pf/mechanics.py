@@ -189,7 +189,7 @@ class MechanicsModel:
         self._krylov_pause_left = 0
 
     def twin_strain(self, eta: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """根据孪晶序参数 eta 计算孪晶本征应变。"""
+        """根据孪晶序参量 eta 计算本征应变（体积分数使用 f_twin=h(eta)）。"""
         h = smooth_heaviside(eta)
         g = self.cfg.twinning.gamma_twin
         exx = h * g * self.sx * self.nx

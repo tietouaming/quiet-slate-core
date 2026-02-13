@@ -166,6 +166,10 @@ class CorrosionConfig:
     pitting_min_factor: float = 0.2
     pitting_max_factor: float = 5.0
     yield_strain_for_mech: float = 0.002
+    # 速率型机械耦合：优先使用 epspeq_dot 而非累计 epspeq，避免“历史塑性永久放大”。
+    use_epspeq_rate_for_mobility: bool = True
+    epspeq_dot_ref_s_inv: float = 1.0e-3
+    k_epsdot: float = 1.0
     include_mech_term_in_phi_variation: bool = False
     include_twin_grad_term_in_phi_variation: bool = False
     # 若启用 include_mech_term_in_phi_variation，则在自由能中加入一致的 -h(phi)*e_mech 近似项，
@@ -181,9 +185,12 @@ class CorrosionConfig:
 @dataclass
 class TwinningConfig:
     """孪晶相场参数（当前实现为单序参数等效描述）。"""
+    # 序参量动力学系数（与 MPa 能量尺度配套，单位近似 1/(MPa*s)）。
+    # 注意：其物理含义与几何孪晶剪切 gamma_twin 完全不同，不能混淆。
     L_eta: float = 0.1295
     W_barrier_MPa: float = 8.86
     kappa_eta: float = 6.0e-3
+    # 几何孪晶剪切幅值（Mg {10-12} 扩展孪晶常见量级约 0.129）。
     gamma_twin: float = 0.129
     twin_crss_MPa: float = 30.0
     twin_shear_dir_angle_deg: float = 35.0
@@ -346,6 +353,8 @@ class MLConfig:
     surrogate_update_plastic_fields: bool = False
     # 当 surrogate 允许更新塑性场时，是否在 accept 后同步推进 CP 内变量（g/gamma_accum）。
     surrogate_sync_cp_state_on_accept: bool = True
+    # surrogate / warmstart 通道量纲归一化（位移、应变量）开关。
+    enable_field_scaling: bool = True
 
 
 @dataclass

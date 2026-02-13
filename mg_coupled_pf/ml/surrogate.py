@@ -20,31 +20,34 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..operators import smooth_heaviside
+from .scaling import sanitize_field_scales
 
 
 FIELD_ORDER = ["phi", "c", "eta", "ux", "uy", "epspeq", "epsp_xx", "epsp_yy", "epsp_xy"]
 
 
-def state_to_tensor(state: Dict[str, torch.Tensor]) -> torch.Tensor:
+def state_to_tensor(state: Dict[str, torch.Tensor], field_scales: Dict[str, float] | None = None) -> torch.Tensor:
     """按固定通道顺序将状态字典拼接为网络输入。"""
     if not state:
         raise ValueError("state_to_tensor received empty state.")
+    scales = sanitize_field_scales(FIELD_ORDER, field_scales)
     ref = next(iter(state.values()))
     chans: List[torch.Tensor] = []
     for k in FIELD_ORDER:
         if k in state:
-            chans.append(state[k])
+            chans.append(state[k] / scales[k])
         else:
             # 兼容旧状态字典：缺失通道以零场填充。
             chans.append(torch.zeros_like(ref))
     return torch.cat(chans, dim=1)
 
 
-def tensor_to_state(x: torch.Tensor) -> Dict[str, torch.Tensor]:
+def tensor_to_state(x: torch.Tensor, field_scales: Dict[str, float] | None = None) -> Dict[str, torch.Tensor]:
     """将网络输出张量拆回状态字典。"""
+    scales = sanitize_field_scales(FIELD_ORDER, field_scales)
     out: Dict[str, torch.Tensor] = {}
     for i, k in enumerate(FIELD_ORDER):
-        out[k] = x[:, i : i + 1]
+        out[k] = x[:, i : i + 1] * scales[k]
     return out
 
 
@@ -363,7 +366,11 @@ class SurrogatePredictor:
     dirichlet_right_ux: float = 0.0
     enforce_uy_anchor: bool = True
     allow_plastic_outputs: bool = True
+    field_scales: Dict[str, float] = field(default_factory=dict)
     arch_kwargs: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.field_scales = sanitize_field_scales(FIELD_ORDER, self.field_scales)
 
     @staticmethod
     def _use_dirichlet_x(loading_mode: str) -> bool:
@@ -389,7 +396,7 @@ class SurrogatePredictor:
         else:
             amp_ctx = nullcontext()
         with torch.inference_mode(), amp_ctx:
-            x_base = state_to_tensor(state)
+            x_base = state_to_tensor(state, field_scales=self.field_scales)
             x = x_base
             if self.model_arch in {"fno2d", "afno2d"}:
                 x = x.float()
@@ -397,7 +404,7 @@ class SurrogatePredictor:
                 x = x.contiguous(memory_format=torch.channels_last)
             dx = self.model(x)
             x1 = x_base + dx.to(dtype=x_base.dtype)
-        nxt = tensor_to_state(x1)
+        nxt = tensor_to_state(x1, field_scales=self.field_scales)
         nxt["phi"] = _soft_project_01(torch.nan_to_num(nxt["phi"], nan=0.5, posinf=1.0, neginf=0.0))
         nxt["c"] = _soft_project_01(torch.nan_to_num(nxt["c"], nan=0.5, posinf=1.0, neginf=0.0))
         nxt["eta"] = _soft_project_01(torch.nan_to_num(nxt["eta"], nan=0.0, posinf=1.0, neginf=0.0))
@@ -556,6 +563,7 @@ def build_surrogate(
     afno_modes_y: int = 12,
     afno_depth: int = 4,
     afno_expansion: float = 2.0,
+    field_scales: Dict[str, float] | None = None,
 ) -> SurrogatePredictor:
     """构建可直接用于推理的 SurrogatePredictor。"""
     model, arch, arch_kwargs = _build_model(
@@ -586,6 +594,7 @@ def build_surrogate(
         channels_last=channels_last and device.type == "cuda",
         model_arch=arch,
         add_coord_features=bool(add_coord_features),
+        field_scales=sanitize_field_scales(FIELD_ORDER, field_scales),
         arch_kwargs=arch_kwargs,
     )
 
@@ -601,6 +610,7 @@ def save_surrogate(predictor: SurrogatePredictor, path: str | Path) -> None:
                 "model_arch": predictor.model_arch,
                 "arch_kwargs": predictor.arch_kwargs,
                 "add_coord_features": bool(predictor.add_coord_features),
+                "field_scales": dict(predictor.field_scales),
                 "field_order": FIELD_ORDER,
             },
         },
@@ -615,6 +625,7 @@ def load_surrogate(
     *,
     fallback_model_arch: str = "tiny_unet",
     fallback_arch_kwargs: Dict[str, Any] | None = None,
+    fallback_field_scales: Dict[str, float] | None = None,
 ) -> SurrogatePredictor:
     """加载 surrogate 并恢复到可推理状态。"""
     payload = torch.load(Path(path), map_location=device)
@@ -630,6 +641,12 @@ def load_surrogate(
     meta_kwargs = meta.get("arch_kwargs")
     if isinstance(meta_kwargs, dict):
         arch_kwargs.update(meta_kwargs)
+    field_scales: Dict[str, float] = {}
+    if isinstance(fallback_field_scales, dict):
+        field_scales.update(fallback_field_scales)
+    meta_scales = meta.get("field_scales")
+    if isinstance(meta_scales, dict):
+        field_scales.update({str(k): float(v) for k, v in meta_scales.items()})
 
     arch = _normalize_arch(str(meta.get("model_arch", fallback_model_arch)))
     add_coord_features = bool(meta.get("add_coord_features", arch_kwargs.get("add_coord_features", True)))
@@ -651,6 +668,7 @@ def load_surrogate(
         afno_modes_y=int(arch_kwargs.get("afno_modes_y", 12)),
         afno_depth=int(arch_kwargs.get("afno_depth", 4)),
         afno_expansion=float(arch_kwargs.get("afno_expansion", 2.0)),
+        field_scales=field_scales,
     )
     state_dict = payload["state_dict"] if isinstance(payload, dict) and "state_dict" in payload else payload
     # 兼容旧 checkpoint（输入通道数变更时会出现 shape mismatch）。
@@ -664,5 +682,6 @@ def load_surrogate(
     predictor.model = _maybe_compile(predictor.model, use_torch_compile)
     predictor.model_arch = arch
     predictor.add_coord_features = bool(add_coord_features)
+    predictor.field_scales = sanitize_field_scales(FIELD_ORDER, field_scales)
     predictor.arch_kwargs = dict(arch_kwargs)
     return predictor
