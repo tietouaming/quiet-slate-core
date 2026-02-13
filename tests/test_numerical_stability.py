@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import torch
 
@@ -705,6 +706,87 @@ def test_cp_phase_dependent_strength_affects_plastic_rate() -> None:
     m_rate = float(torch.mean(out_m["epspeq_dot"]).item())
     t_rate = float(torch.mean(out_t["epspeq_dot"]).item())
     assert t_rate > m_rate
+
+
+def test_twin_nucleation_activation_positive_shear_only() -> None:
+    """孪晶形核激活仅应对有利剪切方向开启。"""
+    cfg = load_config("configs/notch_case.yaml")
+    sim = CoupledSimulator(cfg)
+    tau = torch.tensor([[[[-50.0, 0.0, 20.0, 30.0, 45.0]]]], dtype=torch.float32)
+    act = sim._twin_nucleation_activation(tau)
+    # twin_crss=30：<=30 时为 0，>30 时线性开启。
+    assert float(act[0, 0, 0, 0].item()) == 0.0
+    assert float(act[0, 0, 0, 1].item()) == 0.0
+    assert float(act[0, 0, 0, 2].item()) == 0.0
+    assert float(act[0, 0, 0, 3].item()) == 0.0
+    assert float(act[0, 0, 0, 4].item()) > 0.0
+
+
+def test_surrogate_limit_freezes_plastic_fields_by_default() -> None:
+    """默认配置下 surrogate 不应直接更新塑性历史场。"""
+    cfg = load_config("configs/notch_case.yaml")
+    cfg.ml.enabled = False
+    cfg.ml.surrogate_update_mechanics_fields = True
+    cfg.ml.surrogate_update_plastic_fields = False
+    sim = CoupledSimulator(cfg)
+    prev = {k: v.clone() for k, v in sim.state.items()}
+    nxt = {k: v.clone() for k, v in sim.state.items()}
+    nxt["ux"] = prev["ux"] + 0.02
+    nxt["uy"] = prev["uy"] - 0.02
+    nxt["epspeq"] = prev["epspeq"] + 0.2
+    nxt["epsp_xx"] = prev["epsp_xx"] + 0.2
+    nxt["epsp_yy"] = prev["epsp_yy"] - 0.2
+    nxt["epsp_xy"] = prev["epsp_xy"] + 0.2
+    out = sim._limit_surrogate_update(prev, nxt)
+    # 位移可更新（受限幅），塑性场必须回退到 prev。
+    assert float(torch.mean(torch.abs(out["ux"] - prev["ux"])).item()) > 0.0
+    assert float(torch.mean(torch.abs(out["uy"] - prev["uy"])).item()) > 0.0
+    assert torch.allclose(out["epspeq"], prev["epspeq"])
+    assert torch.allclose(out["epsp_xx"], prev["epsp_xx"])
+    assert torch.allclose(out["epsp_yy"], prev["epsp_yy"])
+    assert torch.allclose(out["epsp_xy"], prev["epsp_xy"])
+
+
+def test_surrogate_accept_syncs_cp_state_when_plastic_enabled() -> None:
+    """当允许 surrogate 更新塑性场时，accept 后应同步推进 CP 内变量。"""
+    cfg = load_config("configs/notch_case.yaml")
+    cfg.ml.enabled = False
+    cfg.ml.surrogate_update_plastic_fields = True
+    cfg.ml.surrogate_sync_cp_state_on_accept = True
+    sim = CoupledSimulator(cfg)
+    # 构造高应力，确保 CP 发生非零滑移累积。
+    shape = sim.state["phi"].shape
+    dev = sim.state["phi"].device
+    dtp = sim.state["phi"].dtype
+    mech_for_cp = {
+        "sigma_xx": torch.full(shape, 40.0, device=dev, dtype=dtp),
+        "sigma_yy": torch.full(shape, 5.0, device=dev, dtype=dtp),
+        "sigma_xy": torch.full(shape, 60.0, device=dev, dtype=dtp),
+    }
+    g0 = sim.cp_state["g"].clone()
+    ga0 = sim.cp_state["gamma_accum"].clone()
+    sim._sync_cp_state_on_surrogate_accept(dt_s=cfg.numerics.dt_s, mech_for_cp=mech_for_cp)
+    # 至少应使累计滑移增加；g 一般也会增大（硬化）。
+    assert float(torch.mean(sim.cp_state["gamma_accum"] - ga0).item()) > 0.0
+    assert float(torch.mean(sim.cp_state["g"] - g0).item()) >= 0.0
+
+
+def test_load_config_ignores_deprecated_unknown_fields(tmp_path: Path) -> None:
+    """旧配置多余键（如 h_power）不应导致 load_config 失败。"""
+    cfg_text = """
+domain:
+  nx: 16
+  ny: 12
+twinning:
+  h_power: 5
+  twin_crss_MPa: 31.0
+"""
+    p = tmp_path / "legacy_cfg.yaml"
+    p.write_text(cfg_text, encoding="utf-8")
+    cfg = load_config(p)
+    assert cfg.domain.nx == 16
+    assert cfg.domain.ny == 12
+    assert abs(cfg.twinning.twin_crss_MPa - 31.0) < 1e-12
 
 
 def test_mechanics_anisotropic_hcp_stress_is_finite() -> None:

@@ -167,6 +167,7 @@ class CoupledSimulator:
                 self.surrogate.loading_mode = str(cfg.mechanics.loading_mode)
                 self.surrogate.dirichlet_right_ux = float(self.mech._dirichlet_right_ux())
                 self.surrogate.enforce_uy_anchor = True
+                self.surrogate.allow_plastic_outputs = bool(getattr(cfg.ml, "surrogate_update_plastic_fields", False))
             pm = Path(getattr(cfg.ml, "mechanics_warmstart_model_path", ""))
             if bool(getattr(cfg.ml, "mechanics_warmstart_enabled", False)) and pm.exists():
                 self.mech_warmstart = load_mechanics_warmstart(
@@ -541,9 +542,9 @@ class CoupledSimulator:
         tw_drive = hphi * tau_tw * self.cfg.twinning.gamma_twin * heta_d
         r2 = (self.grid.x_um - self.cfg.domain.notch_tip_x_um) ** 2 + (self.grid.y_um - self.cfg.domain.notch_center_y_um) ** 2
         nuc = torch.exp(-r2 / max(self.cfg.twinning.nucleation_center_radius_um ** 2, 1e-12))
-        act = torch.relu(torch.abs(tau_tw) - self.cfg.twinning.twin_crss_MPa)
-        langevin = hphi * self.cfg.twinning.langevin_nucleation_noise * nuc * act
-        eta_source = twin_dw - tw_drive - langevin
+        act = self._twin_nucleation_activation(tau_tw)
+        nuc_source = hphi * self._twin_nucleation_source_amp() * nuc * act
+        eta_source = twin_dw - tw_drive - nuc_source
         grad_term = self._div_diffusive_fv(
             eta,
             torch.clamp(grad_coef_eta, min=0.0),
@@ -639,6 +640,28 @@ class CoupledSimulator:
             self._current_rollout_every -= 1
             self.stats["ml_rollout_decrease"] += 1
         self._rollout_reject_streak = 0
+
+    def _sync_cp_state_on_surrogate_accept(self, dt_s: float, mech_for_cp: Dict[str, torch.Tensor] | None = None) -> None:
+        """在 surrogate 接受后同步 CP 内变量，避免 epsp 与硬化历史脱节。"""
+        if not bool(getattr(self.cfg.ml, "surrogate_update_plastic_fields", False)):
+            return
+        if not bool(getattr(self.cfg.ml, "surrogate_sync_cp_state_on_accept", True)):
+            return
+        mech_cp = mech_for_cp if mech_for_cp is not None else self._estimate_state_mechanics(self.state)
+        cp_out = self.cp.update(
+            cp_state=self.cp_state,
+            sigma_xx=mech_cp["sigma_xx"],
+            sigma_yy=mech_cp["sigma_yy"],
+            sigma_xy=mech_cp["sigma_xy"],
+            eta=self.state["eta"],
+            dt_s=dt_s,
+            material_overrides=self._material_overrides(),
+        )
+        self.cp_state["g"] = cp_out["g"]
+        self.cp_state["gamma_accum"] = cp_out["gamma_accum"]
+        # surrogate 已经给出塑性场时，不在此重复积分 epsp_dot，仅同步内部缓存。
+        self.epsp = self._epsp_from_state(self.state)
+        self._sync_epsp_to_state()
 
     def _estimate_diffusion_dt_limit(self) -> float:
         """估计显式扩散稳定步长上限。"""
@@ -1225,6 +1248,17 @@ class CoupledSimulator:
         )
         return tau
 
+    def _twin_nucleation_activation(self, tau_tw: torch.Tensor) -> torch.Tensor:
+        """孪晶形核激活：仅对有利剪切方向（tau_tw > twin_crss）开启。"""
+        return torch.relu(tau_tw - float(self.cfg.twinning.twin_crss_MPa))
+
+    def _twin_nucleation_source_amp(self) -> float:
+        """获取形核源项幅值（兼容旧键名 langevin_nucleation_noise）。"""
+        amp_new = float(getattr(self.cfg.twinning, "nucleation_source_amp", 0.0))
+        if amp_new > 0.0:
+            return amp_new
+        return float(getattr(self.cfg.twinning, "langevin_nucleation_noise", 0.0))
+
     def _sanitize_state(self) -> None:
         """对状态做数值清洗与物理约束裁剪。"""
         cmin = self.cfg.corrosion.cMg_min
@@ -1453,16 +1487,27 @@ class CoupledSimulator:
         limit_field("phi", 1.0)
         limit_field("eta", 1.0)
         limit_field("c", 1.5)
-        if self.cfg.ml.surrogate_update_mechanics_fields:
+        update_mech = bool(getattr(self.cfg.ml, "surrogate_update_mechanics_fields", True))
+        update_plastic = bool(getattr(self.cfg.ml, "surrogate_update_plastic_fields", False))
+        if update_mech:
             limit_field("ux", 0.5)
             limit_field("uy", 0.5)
-            limit_field("epspeq", 0.2)
-            if "epsp_xx" in prev and "epsp_xx" in nxt:
-                limit_field("epsp_xx", 0.2)
-            if "epsp_yy" in prev and "epsp_yy" in nxt:
-                limit_field("epsp_yy", 0.2)
-            if "epsp_xy" in prev and "epsp_xy" in nxt:
-                limit_field("epsp_xy", 0.2)
+            if update_plastic:
+                limit_field("epspeq", 0.2)
+                if "epsp_xx" in prev and "epsp_xx" in nxt:
+                    limit_field("epsp_xx", 0.2)
+                if "epsp_yy" in prev and "epsp_yy" in nxt:
+                    limit_field("epsp_yy", 0.2)
+                if "epsp_xy" in prev and "epsp_xy" in nxt:
+                    limit_field("epsp_xy", 0.2)
+            else:
+                out["epspeq"] = prev["epspeq"]
+                if "epsp_xx" in prev:
+                    out["epsp_xx"] = prev["epsp_xx"]
+                if "epsp_yy" in prev:
+                    out["epsp_yy"] = prev["epsp_yy"]
+                if "epsp_xy" in prev:
+                    out["epsp_xy"] = prev["epsp_xy"]
         else:
             out["ux"] = prev["ux"]
             out["uy"] = prev["uy"]
@@ -1733,10 +1778,10 @@ class CoupledSimulator:
         # 在缺口附近且分解剪应力超过阈值时引入成核扰动。
         r2 = (self.grid.x_um - self.cfg.domain.notch_tip_x_um) ** 2 + (self.grid.y_um - self.cfg.domain.notch_center_y_um) ** 2
         nuc = torch.exp(-r2 / max(self.cfg.twinning.nucleation_center_radius_um ** 2, 1e-12))
-        act = torch.relu(torch.abs(tau_tw) - self.cfg.twinning.twin_crss_MPa)
-        langevin = hphi_eta * self.cfg.twinning.langevin_nucleation_noise * nuc * act
+        act = self._twin_nucleation_activation(tau_tw)
+        nuc_source = hphi_eta * self._twin_nucleation_source_amp() * nuc * act
 
-        eta_source = twin_dw - tw_drive - langevin
+        eta_source = twin_dw - tw_drive - nuc_source
         eta_source = torch.nan_to_num(eta_source, nan=0.0, posinf=0.0, neginf=0.0)
         eta_mode = str(self.cfg.numerics.eta_integrator).strip().lower()
         if eta_mode.startswith("imex"):
@@ -1853,6 +1898,8 @@ class CoupledSimulator:
                             else:
                                 # 若不做校正，至少用当前位移场重建一致的应力诊断量。
                                 self.last_mech = self._estimate_state_mechanics(self.state)
+                            # 若 surrogate 直接更新了塑性场，则同步推进 CP 内变量，保持状态闭合。
+                            self._sync_cp_state_on_surrogate_accept(dt_s=dt, mech_for_cp=self.last_mech)
                             self._surrogate_reject_streak = 0
                             self._surrogate_pause_until_step = step_idx
                             self._on_surrogate_accept()

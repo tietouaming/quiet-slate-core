@@ -362,6 +362,7 @@ class SurrogatePredictor:
     loading_mode: str = "eigenstrain"
     dirichlet_right_ux: float = 0.0
     enforce_uy_anchor: bool = True
+    allow_plastic_outputs: bool = True
     arch_kwargs: Dict[str, Any] = field(default_factory=dict)
 
     @staticmethod
@@ -407,6 +408,12 @@ class SurrogatePredictor:
         nxt["epsp_xx"] = torch.clamp(torch.nan_to_num(nxt["epsp_xx"], nan=0.0, posinf=0.0, neginf=0.0), min=-1.0, max=1.0)
         nxt["epsp_yy"] = torch.clamp(torch.nan_to_num(nxt["epsp_yy"], nan=0.0, posinf=0.0, neginf=0.0), min=-1.0, max=1.0)
         nxt["epsp_xy"] = torch.clamp(torch.nan_to_num(nxt["epsp_xy"], nan=0.0, posinf=0.0, neginf=0.0), min=-1.0, max=1.0)
+        if not self.allow_plastic_outputs:
+            # 仅预测微结构与位移，塑性历史量由物理 CP 路径维护。
+            nxt["epspeq"] = state["epspeq"]
+            nxt["epsp_xx"] = state["epsp_xx"]
+            nxt["epsp_yy"] = state["epsp_yy"]
+            nxt["epsp_xy"] = state["epsp_xy"]
         # 连续相场门控，避免硬阈值在界面处引入数值跳变。
         solid = smooth_heaviside(nxt["phi"], clamp_input=False)
         nxt["eta"] = nxt["eta"] * solid

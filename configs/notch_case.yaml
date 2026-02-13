@@ -65,13 +65,12 @@ twinning:
   L_eta: 0.1295
   W_barrier_MPa: 8.86
   kappa_eta: 0.006
-  h_power: 3
   gamma_twin: 0.129
   twin_crss_MPa: 30.0
   twin_shear_dir_angle_deg: 35.0
   twin_plane_normal_angle_deg: 125.0
   scale_twin_gradient_by_hphi: true
-  langevin_nucleation_noise: 0.0002
+  nucleation_source_amp: 0.0002
   nucleation_center_radius_um: 3.0
 
 crystal_plasticity:

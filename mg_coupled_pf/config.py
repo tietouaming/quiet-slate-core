@@ -18,7 +18,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 import json
 from pathlib import Path
 from typing import Any, Dict, List
@@ -184,12 +184,14 @@ class TwinningConfig:
     L_eta: float = 0.1295
     W_barrier_MPa: float = 8.86
     kappa_eta: float = 6.0e-3
-    h_power: int = 3
     gamma_twin: float = 0.129
     twin_crss_MPa: float = 30.0
     twin_shear_dir_angle_deg: float = 35.0
     twin_plane_normal_angle_deg: float = 125.0
     scale_twin_gradient_by_hphi: bool = True
+    # 形核源项幅值（默认确定性源，不引入随机噪声）。
+    nucleation_source_amp: float = 2e-4
+    # 兼容旧配置键名，后续将逐步移除。
     langevin_nucleation_noise: float = 2e-4
     nucleation_center_radius_um: float = 3.0
 
@@ -340,6 +342,10 @@ class MLConfig:
     disable_surrogate_after_reject_burst: bool = True
     surrogate_delta_scale: float = 1.0
     surrogate_update_mechanics_fields: bool = True
+    # 将“位移更新”和“塑性场更新”解耦，默认禁止 surrogate 直接改塑性历史量。
+    surrogate_update_plastic_fields: bool = False
+    # 当 surrogate 允许更新塑性场时，是否在 accept 后同步推进 CP 内变量（g/gamma_accum）。
+    surrogate_sync_cp_state_on_accept: bool = True
 
 
 @dataclass
@@ -386,6 +392,12 @@ def _deep_update(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
         else:
             dst[k] = v
     return dst
+
+
+def _filter_dataclass_kwargs(dc_type, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """过滤 dataclass 未声明字段，保证旧配置键名不致使加载失败。"""
+    names = {f.name for f in fields(dc_type)}
+    return {k: v for k, v in payload.items() if k in names}
 
 
 def default_slip_systems_hcp_3d() -> List[Dict[str, Any]]:
@@ -457,15 +469,17 @@ def load_config(config_path: str | Path | None = None) -> SimulationConfig:
         }
         _deep_update(merged, data)
         # 逐子配置回填到 dataclass，保留类型约束。
-        cfg.domain = DomainConfig(**merged["domain"])
-        cfg.numerics = NumericsConfig(**merged["numerics"])
-        cfg.corrosion = CorrosionConfig(**merged["corrosion"])
-        cfg.twinning = TwinningConfig(**merged["twinning"])
-        cfg.crystal_plasticity = CrystalPlasticityConfig(**merged["crystal_plasticity"])
-        cfg.mechanics = MechanicsConfig(**merged["mechanics"])
-        cfg.ml = MLConfig(**merged["ml"])
-        cfg.extensions = ExtensionsConfig(**merged["extensions"])
-        cfg.runtime = RuntimeConfig(**merged["runtime"])
+        cfg.domain = DomainConfig(**_filter_dataclass_kwargs(DomainConfig, merged["domain"]))
+        cfg.numerics = NumericsConfig(**_filter_dataclass_kwargs(NumericsConfig, merged["numerics"]))
+        cfg.corrosion = CorrosionConfig(**_filter_dataclass_kwargs(CorrosionConfig, merged["corrosion"]))
+        cfg.twinning = TwinningConfig(**_filter_dataclass_kwargs(TwinningConfig, merged["twinning"]))
+        cfg.crystal_plasticity = CrystalPlasticityConfig(
+            **_filter_dataclass_kwargs(CrystalPlasticityConfig, merged["crystal_plasticity"])
+        )
+        cfg.mechanics = MechanicsConfig(**_filter_dataclass_kwargs(MechanicsConfig, merged["mechanics"]))
+        cfg.ml = MLConfig(**_filter_dataclass_kwargs(MLConfig, merged["ml"]))
+        cfg.extensions = ExtensionsConfig(**_filter_dataclass_kwargs(ExtensionsConfig, merged["extensions"]))
+        cfg.runtime = RuntimeConfig(**_filter_dataclass_kwargs(RuntimeConfig, merged["runtime"]))
     slip_path = Path(cfg.crystal_plasticity.slip_systems_file)
     # 最终统一加载滑移系（JSON 或默认）。
     cfg.slip_systems = _load_slip_systems(slip_path)
