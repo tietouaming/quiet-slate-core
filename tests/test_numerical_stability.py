@@ -468,7 +468,7 @@ def test_phi_residual_uses_allen_cahn_l_times_laplacian_form() -> None:
         bc=sim._scalar_bc(),
     )
     r_expected = (phi - prev["phi"]) / max(dt, 1e-12) + L_phi * (phi_nonlin - phi_lap_kappa)
-    pde_expected = sim._masked_mean_abs(r_expected)
+    pde_expected = sim._masked_mean_abs(r_expected) * dt
     assert abs(float(got["pde_phi"]) - float(pde_expected)) < 1e-10
 
 
@@ -526,7 +526,7 @@ def test_phi_twin_gradient_variation_sign_consistent() -> None:
         bc=sim._scalar_bc(),
     )
     r_expected = (phi - prev["phi"]) / max(dt, 1e-12) + L_phi * (phi_nonlin - phi_lap_kappa)
-    pde_expected = sim._masked_mean_abs(r_expected)
+    pde_expected = sim._masked_mean_abs(r_expected) * dt
     assert abs(float(got["pde_phi"]) - float(pde_expected)) < 1e-9
 
 
@@ -682,3 +682,26 @@ def test_mechanics_stress_divergence_uses_traction_free_on_neumann_boundaries() 
     assert left > 0.5
     assert right < -0.5
     assert float(torch.max(torch.abs(div_y)).item()) < 1e-6
+
+
+def test_cp_phase_dependent_strength_affects_plastic_rate() -> None:
+    """孪晶相强度缩放开启时，eta 改变应影响塑性应变率。"""
+    cfg = load_config("configs/notch_case.yaml")
+    cfg.runtime.device = "cpu"
+    cfg.crystal_plasticity.use_phase_dependent_strength = True
+    cfg.crystal_plasticity.matrix_crss_scale = 1.0
+    cfg.crystal_plasticity.twin_crss_scale = 0.7
+    cfg.crystal_plasticity.matrix_hardening_scale = 1.0
+    cfg.crystal_plasticity.twin_hardening_scale = 1.0
+    cp = CrystalPlasticityModel(cfg, device=torch.device("cpu"), dtype=torch.float32)
+    cp_state = cp.init_state(ny=8, nx=10)
+    sigma_xx = torch.full((1, 1, 8, 10), 16.0)
+    sigma_yy = torch.zeros_like(sigma_xx)
+    sigma_xy = torch.full_like(sigma_xx, 18.0)
+    eta_m = torch.zeros_like(sigma_xx)
+    eta_t = torch.ones_like(sigma_xx)
+    out_m = cp.update(cp_state, sigma_xx, sigma_yy, sigma_xy, eta_m, dt_s=1e-4)
+    out_t = cp.update(cp_state, sigma_xx, sigma_yy, sigma_xy, eta_t, dt_s=1e-4)
+    m_rate = float(torch.mean(out_m["epspeq_dot"]).item())
+    t_rate = float(torch.mean(out_t["epspeq_dot"]).item())
+    assert t_rate > m_rate

@@ -35,7 +35,6 @@ from .operators import (
     laplacian,
     smooth_heaviside,
     smooth_heaviside_prime,
-    solid_indicator,
 )
 
 
@@ -263,6 +262,16 @@ class CoupledSimulator:
         """计算全域面积加权平均。"""
         return torch.sum(x * self.area_weights)
 
+    @staticmethod
+    def _twin_fraction(eta: torch.Tensor) -> torch.Tensor:
+        """孪晶体积分数：f_twin = h(eta)。"""
+        return smooth_heaviside(torch.clamp(eta, 0.0, 1.0))
+
+    @staticmethod
+    def _solid_weight(phi: torch.Tensor) -> torch.Tensor:
+        """固相连续权重：w_solid = h(phi)。"""
+        return smooth_heaviside(torch.clamp(phi, 0.0, 1.0))
+
     def _project_concentration_mean(
         self,
         c: torch.Tensor,
@@ -358,7 +367,7 @@ class CoupledSimulator:
             x_coords_um=self.x_coords_um,
             y_coords_um=self.y_coords_um,
         )
-        solid = solid_indicator(phi, self.cfg.domain.solid_phase_threshold)
+        solid = self._solid_weight(phi)
         return 0.5 * (
             self._masked_mean_abs(res_x, solid)
             + self._masked_mean_abs(res_y, solid)
@@ -513,7 +522,7 @@ class CoupledSimulator:
             mech_for_coupler=mech_state,
         )
         r_c = (cbar - prev["c"]) / dt - rhs_c
-        pde_c = self._masked_mean_abs(r_c)
+        pde_c_raw = self._masked_mean_abs(r_c)
 
         heta = smooth_heaviside(eta, clamp_input=False)
         heta_d = smooth_heaviside_prime(eta, clamp_input=False)
@@ -539,15 +548,26 @@ class CoupledSimulator:
             bc=bc,
         )
         r_eta = (eta - prev["eta"]) / dt + self.cfg.twinning.L_eta * (eta_source - grad_term)
-        solid = solid_indicator(phi, self.cfg.domain.solid_phase_threshold)
-        pde_eta = self._masked_mean_abs(r_eta, solid)
+        solid = self._solid_weight(phi)
+        pde_eta_raw = self._masked_mean_abs(r_eta, solid)
 
-        pde_mech = self._compute_mechanics_residual(mech_state, phi)
+        pde_mech_raw = self._compute_mechanics_residual(mech_state, phi)
+        # 无量纲残差：便于统一门控阈值。
+        phi_scale = max(1.0 / dt, 1e-12)
+        eta_scale = max(1.0 / dt, 1e-12)
+        c_scale = max((self.cfg.corrosion.cMg_max - self.cfg.corrosion.cMg_min) / dt, 1e-12)
+        l_ref = max(min(float(self.dx_um), float(self.dy_um)), 1e-9)
+        sigma_ref = max(float(self.cfg.mechanics.mu_GPa * 1e3), 1.0)
+        mech_scale = max(sigma_ref / l_ref, 1e-12)
+        pde_phi = float(pde_phi / phi_scale)
+        pde_c = float(pde_c_raw / c_scale)
+        pde_eta = float(pde_eta_raw / eta_scale)
+        pde_mech = float(pde_mech_raw / mech_scale)
         return {
-            "pde_phi": float(pde_phi),
-            "pde_c": float(pde_c),
-            "pde_eta": float(pde_eta),
-            "pde_mech": float(pde_mech),
+            "pde_phi": pde_phi,
+            "pde_c": pde_c,
+            "pde_eta": pde_eta,
+            "pde_mech": pde_mech,
         }
 
     def _estimate_surrogate_uncertainty(self, prev: Dict[str, torch.Tensor]) -> float:
@@ -579,7 +599,7 @@ class CoupledSimulator:
             pred = self.surrogate.predict(pert)
             dphi = self._masked_mean_abs(pred["phi"] - prev["phi"])
             dc = self._masked_mean_abs(pred["c"] - prev["c"]) / cspan
-            deta = self._masked_mean_abs(pred["eta"] - prev["eta"])
+            deta = self._masked_mean_abs(self._twin_fraction(pred["eta"]) - self._twin_fraction(prev["eta"]))
             vals.append(dphi + dc + deta)
         vt = torch.tensor(vals, device=self.device, dtype=self.dtype)
         return float(torch.std(vt, unbiased=False).item())
@@ -1128,7 +1148,10 @@ class CoupledSimulator:
     def _omega_kappa_phi(self) -> tuple[float, float]:
         """由界面能和厚度换算相场参数 omega 与 kappa。"""
         gamma = self.cfg.corrosion.gamma_J_m2
-        ell_m = self.cfg.corrosion.interface_thickness_um * 1e-6
+        ell_um = float(self.cfg.corrosion.interface_thickness_um)
+        if ell_um <= 0.0:
+            ell_um = float(self.cfg.domain.interface_width_um)
+        ell_m = ell_um * 1e-6
         omega = 3.0 * gamma / (4.0 * ell_m) / 1e6  # MPa
         kappa = 1.5 * gamma * ell_m / 1e6  # MPa*m^2
         return omega, kappa
@@ -1151,11 +1174,16 @@ class CoupledSimulator:
         st = self.state if state is None else state
         mech_state = self.last_mech if mech is None else mech
         c = self.cfg.corrosion
+        L0 = float(c.L0)
+        l0_unit = str(getattr(c, "L0_unit", "1_over_MPa_s")).strip().lower()
+        if l0_unit in {"1_over_pa_s", "1/pa/s", "pa"}:
+            # 代码中化学势/能量以 MPa 为标度，若输入 SI(1/Pa/s) 需转为 1/(MPa*s)。
+            L0 = L0 * 1e6
         sigma_h_pa = mech_state["sigma_h"] * 1e6
         mech_fac = (st["epspeq"] / max(c.yield_strain_for_mech, 1e-12) + 1.0) * torch.exp(
             torch.clamp(sigma_h_pa * c.molar_volume_m3_mol / (c.gas_constant_J_mol_K * c.temperature_K), -12.0, 12.0)
         )
-        out = c.L0 * self.pitting_field * mech_fac
+        out = L0 * self.pitting_field * mech_fac
         for cp in self.couplers:
             out = out * cp.corrosion_mobility_multiplier(st, mech_state)
         return out
@@ -1200,7 +1228,7 @@ class CoupledSimulator:
             0.0,
             1.0,
         )
-        solid = solid_indicator(self.state["phi"], self.cfg.domain.solid_phase_threshold)
+        solid = self._solid_weight(self.state["phi"])
         self.state["c"] = self._soft_project_range(
             torch.nan_to_num(self.state["c"], nan=cmin, posinf=cmax, neginf=cmin),
             cmin,
@@ -1268,7 +1296,7 @@ class CoupledSimulator:
                 return reject("phi_drop")
         max_eta_rise = self.cfg.ml.max_mean_eta_rise
         if max_eta_rise > 0.0:
-            eta_rise = float(self._mean_field(nxt["eta"] - prev["eta"]).item())
+            eta_rise = float(self._mean_field(self._twin_fraction(nxt["eta"]) - self._twin_fraction(prev["eta"])).item())
             if eta_rise > max_eta_rise:
                 return reject("eta_rise")
         phi_abs_delta = self.cfg.ml.max_mean_phi_abs_delta
@@ -1277,7 +1305,7 @@ class CoupledSimulator:
                 return reject("phi_mean_delta")
         eta_abs_delta = self.cfg.ml.max_mean_eta_abs_delta
         if eta_abs_delta > 0.0:
-            if abs(float(self._mean_field(nxt["eta"] - prev["eta"]).item())) > eta_abs_delta:
+            if abs(float(self._mean_field(self._twin_fraction(nxt["eta"]) - self._twin_fraction(prev["eta"])).item())) > eta_abs_delta:
                 return reject("eta_mean_delta")
         c_abs_delta = self.cfg.ml.max_mean_c_abs_delta
         if c_abs_delta > 0.0:
@@ -1316,17 +1344,17 @@ class CoupledSimulator:
             tol = 1e-6
             if torch.max(torch.abs(nxt["phi"] - prev["phi"])).item() > gate + tol:
                 return reject("phi_field_delta")
-            if torch.max(torch.abs(nxt["eta"] - prev["eta"])).item() > gate + tol:
+            if torch.max(torch.abs(self._twin_fraction(nxt["eta"]) - self._twin_fraction(prev["eta"]))).item() > gate + tol:
                 return reject("eta_field_delta")
             if torch.max(torch.abs(nxt["c"] - prev["c"])).item() > gate * 1.5 + tol:
                 return reject("c_field_delta")
         dphi = float(self._mean_field(torch.abs(nxt["phi"] - prev["phi"])).item())
         cspan = max(self.cfg.corrosion.cMg_max - self.cfg.corrosion.cMg_min, 1e-12)
         dc = float(self._mean_field(torch.abs(nxt["c"] - prev["c"])).item()) / cspan
-        deta = float(self._mean_field(torch.abs(nxt["eta"] - prev["eta"])).item())
-        solid_nxt = solid_indicator(nxt["phi"], self.cfg.domain.solid_phase_threshold)
-        liquid = 1.0 - solid_nxt
-        liquid_eta = float(self._mean_field(torch.abs(nxt["eta"] * liquid)).item())
+        deta = float(self._mean_field(torch.abs(self._twin_fraction(nxt["eta"]) - self._twin_fraction(prev["eta"]))).item())
+        solid_nxt = self._solid_weight(nxt["phi"])
+        liquid = torch.clamp(1.0 - solid_nxt, min=0.0, max=1.0)
+        liquid_eta = float(self._mean_field(torch.abs(self._twin_fraction(nxt["eta"]) * liquid)).item())
         if liquid_eta > max(self.cfg.ml.max_mean_eta_abs_delta, 1e-6):
             return reject("liquid_eta")
         liquid_eps = float(self._mean_field(torch.abs(nxt["epspeq"] * liquid)).item())
@@ -1733,7 +1761,7 @@ class CoupledSimulator:
             eta_new = eta - dt_s * self.cfg.twinning.L_eta * eta_rhs
         eta_new = torch.clamp(eta_new, 0.0, 1.0)
         eta_new = torch.nan_to_num(eta_new, nan=0.0, posinf=1.0, neginf=0.0)
-        eta_new = eta_new * solid_indicator(phi_new, self.cfg.domain.solid_phase_threshold)
+        eta_new = eta_new * self._solid_weight(phi_new)
 
         self.state["phi"] = phi_new
         self.state["c"] = c_new
@@ -1846,8 +1874,8 @@ class CoupledSimulator:
 
         # 诊断量均在清洗后的状态上计算，保证输出稳定且可比。
         solid_fraction = float(self._mean_field(self.state["phi"]).item())
-        avg_eta = float(self._mean_field(self.state["eta"]).item())
-        solid = solid_indicator(self.state["phi"], self.cfg.domain.solid_phase_threshold)
+        avg_eta = float(self._mean_field(self._twin_fraction(self.state["eta"])).item())
+        solid = self._solid_weight(self.state["phi"])
         max_sigma_h = float(torch.max(self.last_mech["sigma_h"] * solid).item())
         avg_epspeq = float(self._mean_field(self.state["epspeq"]).item())
         loss_phi_mae = float(self._mean_field(torch.abs(self.state["phi"] - prev_phi)).item())

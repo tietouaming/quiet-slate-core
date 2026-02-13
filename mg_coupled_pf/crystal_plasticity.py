@@ -100,6 +100,7 @@ class CrystalPlasticityModel:
         g = cp_state["g"]
         schmid = self._effective_schmid_tensors(eta)
         p_xx, p_yy, p_xy = schmid["p_xx"], schmid["p_yy"], schmid["p_xy"]
+        f_twin = smooth_heaviside(torch.clamp(eta, 0.0, 1.0))
 
         # 分解剪应力 tau = P:σ，其中 P_xy 分量按工程应力需乘 2。
         tau = p_xx * sigma_xx + p_yy * sigma_yy + 2.0 * p_xy * sigma_xy
@@ -107,6 +108,15 @@ class CrystalPlasticityModel:
         gamma0 = self.cfg.crystal_plasticity.gamma0_s_inv
         m = self.cfg.crystal_plasticity.m_rate_sensitivity
         g_eff = torch.clamp(g, min=1e-6)
+        h_scale = torch.ones_like(g_eff)
+        if bool(getattr(self.cfg.crystal_plasticity, "use_phase_dependent_strength", True)):
+            m_scale = float(getattr(self.cfg.crystal_plasticity, "matrix_crss_scale", 1.0))
+            t_scale = float(getattr(self.cfg.crystal_plasticity, "twin_crss_scale", 1.0))
+            mh = float(getattr(self.cfg.crystal_plasticity, "matrix_hardening_scale", 1.0))
+            th = float(getattr(self.cfg.crystal_plasticity, "twin_hardening_scale", 1.0))
+            crss_scale = (1.0 - f_twin) * m_scale + f_twin * t_scale
+            h_scale = (1.0 - f_twin) * mh + f_twin * th
+            g_eff = g_eff * torch.clamp(crss_scale, min=1e-3, max=1e3)
 
         yield_scale = 1.0
         if material_overrides and "yield_scale" in material_overrides:
@@ -146,6 +156,7 @@ class CrystalPlasticityModel:
         # 与潜硬化矩阵相乘，得到每个系的总硬化速率。
         dg_perm = torch.matmul(abs_perm, self.q_hardening.T) * self.cfg.crystal_plasticity.h_MPa
         dg = dg_perm.permute(0, 3, 1, 2)
+        dg = dg * torch.clamp(h_scale, min=1e-3, max=1e3)
         dg_cap = max(self.cfg.crystal_plasticity.hardening_rate_cap_MPa_s, 1e-6)
         dg = torch.clamp(dg, min=0.0, max=dg_cap)
         g_new = torch.clamp(g + dt_s * dg, min=1e-3)

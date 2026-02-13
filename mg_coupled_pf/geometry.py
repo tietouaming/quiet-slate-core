@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 from .config import SimulationConfig
-from .operators import smooth_heaviside, solid_indicator
+from .operators import smooth_heaviside
 
 
 @dataclass
@@ -81,6 +81,14 @@ def _notch_focus(cfg: SimulationConfig) -> tuple[float, float]:
     if cfg.domain.initial_geometry.lower() == "half_space" and cfg.domain.add_half_space_triangular_notch:
         return float(cfg.domain.half_space_notch_tip_x_um), float(cfg.domain.half_space_notch_center_y_um)
     return float(cfg.domain.notch_tip_x_um), float(cfg.domain.notch_center_y_um)
+
+
+def _interface_width_um(cfg: SimulationConfig) -> float:
+    """返回统一界面厚度（优先 corrosion.interface_thickness_um，其次 domain.interface_width_um）。"""
+    ell = float(getattr(cfg.corrosion, "interface_thickness_um", -1.0))
+    if ell > 0.0:
+        return ell
+    return float(cfg.domain.interface_width_um)
 
 
 def make_grid(cfg: SimulationConfig, device: torch.device, dtype: torch.dtype) -> Grid2D:
@@ -176,7 +184,7 @@ def triangular_notch_profile(
 
 def half_space_profile(cfg: SimulationConfig, grid: Grid2D) -> torch.Tensor:
     """构造“半固体-半液体”初始相场分布。"""
-    interface = max(cfg.domain.interface_width_um, 1e-9)
+    interface = max(_interface_width_um(cfg), 1e-9)
     direction = cfg.domain.half_space_direction.lower()
     if direction == "y":
         y0 = cfg.domain.half_space_interface_y_um
@@ -212,7 +220,7 @@ def initial_fields(cfg: SimulationConfig, grid: Grid2D) -> dict[str, torch.Tenso
                 interface=cfg.domain.half_space_notch_sharpness_um,
                 open_to_positive_x=cfg.domain.half_space_notch_open_to_positive_x,
             )
-            solid = solid_indicator(phi, cfg.domain.solid_phase_threshold)
+            solid = smooth_heaviside(phi)
             # 仅在固相侧应用缺口扣除，避免误改液相。
             phi = torch.clamp(phi * (1.0 - notch * solid), 0.0, 1.0)
     else:
@@ -225,13 +233,17 @@ def initial_fields(cfg: SimulationConfig, grid: Grid2D) -> dict[str, torch.Tenso
             center_y=cfg.domain.notch_center_y_um,
             depth=cfg.domain.notch_depth_um,
             half_opening=cfg.domain.notch_half_opening_um,
-            interface=cfg.domain.interface_width_um,
+            interface=_interface_width_um(cfg),
         )
         phi = phi * (1.0 - notch)
 
         if cfg.domain.add_initial_pit_seed:
             r2 = (grid.x_um - cfg.domain.notch_tip_x_um) ** 2 + (grid.y_um - cfg.domain.notch_center_y_um) ** 2
-            pit = torch.exp(-r2 / max(cfg.domain.initial_pit_radius_um ** 2, 1e-12))
+            sigma = float(getattr(cfg.domain, "initial_pit_sigma_um", -1.0))
+            if sigma <= 0.0:
+                # 兼容旧参数：旧公式 exp(-r^2/R^2) 等价于新公式中 sigma=R/sqrt(2)。
+                sigma = max(float(cfg.domain.initial_pit_radius_um) / math.sqrt(2.0), 1e-9)
+            pit = torch.exp(-0.5 * r2 / max(sigma * sigma, 1e-12))
             phi = torch.clamp(phi - 0.35 * pit, 0.0, 1.0)
 
     hphi = smooth_heaviside(phi)

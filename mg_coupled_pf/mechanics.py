@@ -13,7 +13,7 @@ from typing import Dict, List, Tuple
 import torch
 
 from .config import SimulationConfig
-from .operators import grad_xy, smooth_heaviside, solid_indicator
+from .operators import grad_xy, smooth_heaviside
 
 
 class MechanicsModel:
@@ -96,7 +96,11 @@ class MechanicsModel:
         """线弹性本构：由应变场计算 Cauchy 应力。"""
         hphi = smooth_heaviside(phi)
         if self.cfg.mechanics.strict_solid_stress_only:
-            hphi = hphi * solid_indicator(phi, self.cfg.domain.solid_phase_threshold)
+            # 连续窄带门控，避免硬阈值引入的非物理跳变。
+            thr = float(self.cfg.domain.solid_phase_threshold)
+            band = 0.02
+            gate = 0.5 * (1.0 + torch.tanh((phi - thr) / band))
+            hphi = hphi * torch.clamp(gate, 0.0, 1.0)
         tr = eps_xx + eps_yy
         sigma_xx = hphi * (self.lam * tr + 2.0 * self.mu * eps_xx)
         sigma_yy = hphi * (self.lam * tr + 2.0 * self.mu * eps_yy)
@@ -478,7 +482,10 @@ class MechanicsModel:
         )
         hphi = smooth_heaviside(state["phi"])
         if self.cfg.mechanics.strict_solid_stress_only:
-            hphi = hphi * solid_indicator(state["phi"], self.cfg.domain.solid_phase_threshold)
+            thr = float(self.cfg.domain.solid_phase_threshold)
+            band = 0.02
+            gate = 0.5 * (1.0 + torch.tanh((state["phi"] - thr) / band))
+            hphi = hphi * torch.clamp(gate, 0.0, 1.0)
         if x_coords_um is not None and x_coords_um.numel() > 1:
             dx_min = float(torch.min(x_coords_um[1:] - x_coords_um[:-1]).item())
         else:

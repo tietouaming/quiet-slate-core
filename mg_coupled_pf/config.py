@@ -45,7 +45,11 @@ class DomainConfig:
     notch_center_y_um: float = 125.0
     notch_depth_um: float = 55.0
     notch_half_opening_um: float = 30.0
+    # 统一界面厚度参数（几何初值默认使用该值，腐蚀自由能可选择继承该值）。
     interface_width_um: float = 2.0
+    # 初始 pit 种子高斯核标准差（um）。若 <=0，则回退兼容旧参数 initial_pit_radius_um。
+    initial_pit_sigma_um: float = -1.0
+    # 旧参数：历史版本名称保留用于兼容；推荐使用 initial_pit_sigma_um。
     initial_pit_radius_um: float = 1.5
     add_initial_pit_seed: bool = True
     half_space_direction: str = "x"
@@ -145,12 +149,17 @@ class CorrosionConfig:
     cMg_min: float = 0.0
     cMg_max: float = 1.0
     gamma_J_m2: float = 0.5
-    interface_thickness_um: float = 4.0
+    # <=0 时自动继承 DomainConfig.interface_width_um，实现单一界面厚度来源。
+    interface_thickness_um: float = -1.0
     A_J_m3: float = 6.0e7
     temperature_K: float = 310.15
     molar_volume_m3_mol: float = 13.998e-6
     gas_constant_J_mol_K: float = 8.314462618
+    # 腐蚀相场迁移率系数。
+    # 若 `L0_unit=1_over_MPa_s`，与本代码 MPa 能量尺度直接匹配；
+    # 若 `L0_unit=1_over_Pa_s`，内部会自动乘 1e6 进行单位换算。
     L0: float = 5.0e-8
+    L0_unit: str = "1_over_MPa_s"
     pitting_beta: float = 0.75
     pitting_alpha: float = 3.0
     pitting_N: int = 2
@@ -199,6 +208,13 @@ class CrystalPlasticityConfig:
     basal_crss_MPa: float = 13.0
     prismatic_crss_MPa: float = 57.0
     pyramidal_crss_MPa: float = 100.0
+    # 孪晶-母相强度学耦合（最小可用版本）：
+    # 通过 eta->f_twin 插值对 CRSS 与硬化速率做相依赖缩放。
+    use_phase_dependent_strength: bool = True
+    matrix_crss_scale: float = 1.0
+    twin_crss_scale: float = 0.85
+    matrix_hardening_scale: float = 1.0
+    twin_hardening_scale: float = 1.2
     slip_systems_file: str = "configs/slip_systems_hcp_2d.json"
 
 
@@ -223,7 +239,7 @@ class MechanicsConfig:
     residual_damping_MPa_um: float = 80.0
     max_abs_displacement_um: float = 0.0
     max_abs_strain: float = 0.1
-    strict_solid_stress_only: bool = True
+    strict_solid_stress_only: bool = False
     # 力学离散算子的边界处理（与标量场边界分离）。
     mechanics_bc: str = "neumann"
     # 可选按轴边界条件：若非空则覆盖 mechanics_bc。
@@ -264,12 +280,12 @@ class MLConfig:
     max_mean_eta_abs_delta: float = 1e-3
     max_mean_c_abs_delta: float = 5e-3
     max_mean_epspeq_abs_delta: float = 5e-4
-    # 物理残差门控：对 surrogate 候选状态计算离散 PDE 残差并做阈值判定。
+    # 物理残差门控：对 surrogate 候选状态计算“无量纲”离散 PDE 残差并判定阈值。
     enable_pde_residual_gate: bool = True
     pde_residual_phi_abs_max: float = 5e-2
     pde_residual_eta_abs_max: float = 5e-2
     pde_residual_c_abs_max: float = 5e-2
-    pde_residual_mech_abs_max: float = 5e1
+    pde_residual_mech_abs_max: float = 5e-2
     # 能量门控：限制“无外功项下的离散总能量”异常上升。
     enable_energy_gate: bool = True
     # `true` 时，energy gate 使用严格与当前演化方程匹配的 E_gate（变分核心项）；
