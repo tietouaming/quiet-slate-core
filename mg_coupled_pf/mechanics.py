@@ -13,6 +13,7 @@ from typing import Dict, List, Tuple
 import torch
 
 from .config import SimulationConfig
+from .crystallography import resolve_twin_pair_xy
 from .operators import grad_xy, smooth_heaviside
 
 
@@ -179,12 +180,17 @@ class MechanicsModel:
             if cand:
                 self._stiffness_ref_mpa = max(max(cand), 1e-6)
 
-        ang_s = torch.deg2rad(torch.tensor(cfg.twinning.twin_shear_dir_angle_deg, dtype=torch.float64))
-        ang_n = torch.deg2rad(torch.tensor(cfg.twinning.twin_plane_normal_angle_deg, dtype=torch.float64))
-        self.sx = float(torch.cos(ang_s).item())
-        self.sy = float(torch.sin(ang_s).item())
-        self.nx = float(torch.cos(ang_n).item())
-        self.ny = float(torch.sin(ang_n).item())
+        sx, sy, nx, ny = resolve_twin_pair_xy(
+            cfg.twinning,
+            list(getattr(cfg, "twin_systems", [])),
+            orientation_euler_deg=list(getattr(cfg.mechanics, "crystal_orientation_euler_deg", [0.0, 0.0, 0.0])),
+            device=torch.device("cpu"),
+            dtype=torch.float64,
+        )
+        self.sx = sx
+        self.sy = sy
+        self.nx = nx
+        self.ny = ny
         self._krylov_fail_streak = 0
         self._krylov_pause_left = 0
 

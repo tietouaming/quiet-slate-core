@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 import json
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -26,6 +25,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from mg_coupled_pf import load_config
+from mg_coupled_pf.crystallography import resolve_twin_pair_xy
 from mg_coupled_pf.ml.scaling import build_surrogate_field_scales
 from mg_coupled_pf.ml.surrogate import FIELD_ORDER, arch_requires_full_precision, build_surrogate, save_surrogate
 
@@ -209,6 +209,7 @@ def _physics_losses(
     rollout_target_d: torch.Tensor | None = None,
     rollout_mask: torch.Tensor | None = None,
     rollout_weight: float = 0.0,
+    twin_pair: tuple[float, float, float, float] | None = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """构造监督+物理约束的组合损失。"""
     idx = {k: i for i, k in enumerate(FIELD_ORDER)}
@@ -269,10 +270,15 @@ def _physics_losses(
     dux_dx, dux_dy = _grad_xy_center(ux, dx_um, dy_um)
     duy_dx, duy_dy = _grad_xy_center(uy, dx_um, dy_um)
     # 与主求解器一致：扣除孪晶本征应变与塑性张量分量。
-    ang_s = math.radians(float(cfg.twinning.twin_shear_dir_angle_deg))
-    ang_n = math.radians(float(cfg.twinning.twin_plane_normal_angle_deg))
-    sx, sy = math.cos(ang_s), math.sin(ang_s)
-    nx, ny = math.cos(ang_n), math.sin(ang_n)
+    if twin_pair is None:
+        twin_pair = resolve_twin_pair_xy(
+            cfg.twinning,
+            list(getattr(cfg, "twin_systems", [])),
+            orientation_euler_deg=list(getattr(cfg.mechanics, "crystal_orientation_euler_deg", [0.0, 0.0, 0.0])),
+            device=torch.device("cpu"),
+            dtype=torch.float64,
+        )
+    sx, sy, nx, ny = twin_pair
     h_eta = _smooth_heaviside(eta)
     gamma_tw = float(cfg.twinning.gamma_twin)
     eps_tw_xx = h_eta * gamma_tw * sx * nx
@@ -498,6 +504,13 @@ def main() -> None:
     w_mech = float(max(args.loss_mech_weight, 0.0))
     w_pde = float(max(args.loss_pde_weight, 0.0))
     grad_clip = float(args.grad_clip)
+    twin_pair = resolve_twin_pair_xy(
+        cfg.twinning,
+        list(getattr(cfg, "twin_systems", [])),
+        orientation_euler_deg=list(getattr(cfg.mechanics, "crystal_orientation_euler_deg", [0.0, 0.0, 0.0])),
+        device=torch.device("cpu"),
+        dtype=torch.float64,
+    )
     if args.streaming:
         # 4A) 流式模式：边读边训，适合长时大数据快照。
         train_ds = SnapshotPairDataset(files[: n_train + 1])
@@ -568,6 +581,7 @@ def main() -> None:
                         rollout_target_d=db2,
                         rollout_mask=m2,
                         rollout_weight=rollout_weight,
+                        twin_pair=twin_pair,
                     )
                 scaler.scale(loss).backward()
                 if grad_clip > 0.0:
@@ -613,6 +627,7 @@ def main() -> None:
                         rollout_target_d=db2,
                         rollout_mask=m2,
                         rollout_weight=rollout_weight,
+                        twin_pair=twin_pair,
                     )
                 scaler.scale(loss).backward()
                 if grad_clip > 0.0:
@@ -663,6 +678,7 @@ def main() -> None:
                             rollout_target_d=db2,
                             rollout_mask=m2,
                             rollout_weight=rollout_weight,
+                            twin_pair=twin_pair,
                         )
                         l = float(l_t.item())
                         bs = int(xb.shape[0])
@@ -700,6 +716,7 @@ def main() -> None:
                         rollout_target_d=db2,
                         rollout_mask=m2,
                         rollout_weight=rollout_weight,
+                        twin_pair=twin_pair,
                     )
                     val_loss = float(v_t.item())
         else:

@@ -67,6 +67,10 @@ twinning:
   kappa_eta: 0.006
   gamma_twin: 0.129
   twin_crss_MPa: 30.0
+  twin_hcp_c_over_a: 1.624
+  twin_systems_file: configs/twin_systems_hcp_3d.json
+  twin_variant_index: 0
+  # 旧角度参数仅用于兼容回退；正常路径优先使用 twin_systems_file。
   twin_shear_dir_angle_deg: 35.0
   twin_plane_normal_angle_deg: 125.0
   scale_twin_gradient_by_hphi: true
@@ -84,7 +88,8 @@ crystal_plasticity:
   basal_crss_MPa: 13.0
   prismatic_crss_MPa: 57.0
   pyramidal_crss_MPa: 100.0
-  slip_systems_file: configs/slip_systems_hcp_2d.json
+  hcp_c_over_a: 1.624
+  slip_systems_file: configs/slip_systems_hcp_3d.json
 
 mechanics:
   # Values as referenced in your CP-twinning material

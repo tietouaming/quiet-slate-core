@@ -1,0 +1,12 @@
+[
+  {
+    "name": "ext_twin_1",
+    "direction_mb": [0, -2, 2, 1],
+    "plane_mb": [1, 0, -1, 2]
+  },
+  {
+    "name": "ext_twin_2",
+    "direction_mb": [-2, 0, 2, 1],
+    "plane_mb": [0, 1, -1, 2]
+  }
+]

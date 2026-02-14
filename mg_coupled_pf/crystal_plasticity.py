@@ -17,93 +17,15 @@ from typing import Dict, List, Tuple
 import torch
 
 from .config import SimulationConfig
+from .crystallography import (
+    axis_angle_matrix,
+    bunge_euler_matrix,
+    normalize_vec3,
+    orthonormalize_pair,
+    project_pair_to_xy,
+    resolve_system_pair_crystal,
+)
 from .operators import smooth_heaviside
-
-
-def _angles_to_vectors(angle_deg: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """角度（度）转换为二维单位方向向量。"""
-    ang = torch.deg2rad(angle_deg)
-    return torch.cos(ang), torch.sin(ang)
-
-
-def _normalize_vec3(v: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    """三维向量归一化。"""
-    n = torch.sqrt(torch.clamp(torch.sum(v * v), min=eps))
-    return v / n
-
-
-def _bunge_euler_matrix(euler_deg: List[float], *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """Bunge ZXZ 欧拉角旋转矩阵。"""
-    if len(euler_deg) != 3:
-        raise ValueError("crystal_orientation_euler_deg must have length 3.")
-    a, b, c = [torch.deg2rad(torch.tensor(float(x), device=device, dtype=dtype)) for x in euler_deg]
-    ca, sa = torch.cos(a), torch.sin(a)
-    cb, sb = torch.cos(b), torch.sin(b)
-    cc, sc = torch.cos(c), torch.sin(c)
-    rz1 = torch.stack(
-        [
-            torch.stack([ca, -sa, torch.tensor(0.0, device=device, dtype=dtype)]),
-            torch.stack([sa, ca, torch.tensor(0.0, device=device, dtype=dtype)]),
-            torch.stack([torch.tensor(0.0, device=device, dtype=dtype), torch.tensor(0.0, device=device, dtype=dtype), torch.tensor(1.0, device=device, dtype=dtype)]),
-        ]
-    )
-    rx = torch.stack(
-        [
-            torch.stack([torch.tensor(1.0, device=device, dtype=dtype), torch.tensor(0.0, device=device, dtype=dtype), torch.tensor(0.0, device=device, dtype=dtype)]),
-            torch.stack([torch.tensor(0.0, device=device, dtype=dtype), cb, -sb]),
-            torch.stack([torch.tensor(0.0, device=device, dtype=dtype), sb, cb]),
-        ]
-    )
-    rz2 = torch.stack(
-        [
-            torch.stack([cc, -sc, torch.tensor(0.0, device=device, dtype=dtype)]),
-            torch.stack([sc, cc, torch.tensor(0.0, device=device, dtype=dtype)]),
-            torch.stack([torch.tensor(0.0, device=device, dtype=dtype), torch.tensor(0.0, device=device, dtype=dtype), torch.tensor(1.0, device=device, dtype=dtype)]),
-        ]
-    )
-    return rz1 @ rx @ rz2
-
-
-def _axis_angle_matrix(axis: List[float], angle_deg: float, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """轴角旋转矩阵（Rodrigues）。"""
-    if len(axis) != 3:
-        raise ValueError("twin_reorientation_axis must have length 3.")
-    ax = _normalize_vec3(torch.tensor([float(axis[0]), float(axis[1]), float(axis[2])], device=device, dtype=dtype))
-    th = torch.deg2rad(torch.tensor(float(angle_deg), device=device, dtype=dtype))
-    c = torch.cos(th)
-    s = torch.sin(th)
-    x, y, z = ax[0], ax[1], ax[2]
-    k = torch.tensor(
-        [
-            [0.0, -z.item(), y.item()],
-            [z.item(), 0.0, -x.item()],
-            [-y.item(), x.item(), 0.0],
-        ],
-        device=device,
-        dtype=dtype,
-    )
-    i = torch.eye(3, device=device, dtype=dtype)
-    outer = ax.view(3, 1) @ ax.view(1, 3)
-    return c * i + (1.0 - c) * outer + s * k
-
-
-def _project_pair_to_xy(s3: torch.Tensor, n3: torch.Tensor, eps: float = 1e-12) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """将三维滑移方向/法向投影到二维平面，并做正交化。"""
-    s = s3[:2].clone()
-    n = n3[:2].clone()
-    ns = torch.sqrt(torch.clamp(torch.sum(s * s), min=eps))
-    if float(ns.item()) <= eps:
-        s = torch.tensor([1.0, 0.0], device=s3.device, dtype=s3.dtype)
-    else:
-        s = s / ns
-    # 先去除 n 在 s 上的分量，保证二维投影后依旧近似正交。
-    n = n - torch.sum(n * s) * s
-    nn = torch.sqrt(torch.clamp(torch.sum(n * n), min=eps))
-    if float(nn.item()) <= eps:
-        n = torch.tensor([-s[1].item(), s[0].item()], device=s3.device, dtype=s3.dtype)
-    else:
-        n = n / nn
-    return s[0], s[1], n[0], n[1]
 
 
 class CrystalPlasticityModel:
@@ -122,8 +44,8 @@ class CrystalPlasticityModel:
         euler = list(getattr(cfg.crystal_plasticity, "crystal_orientation_euler_deg", [0.0, 0.0, 0.0]))
         tw_axis = list(getattr(cfg.crystal_plasticity, "twin_reorientation_axis", [0.0, 0.0, 1.0]))
         tw_ang = float(getattr(cfg.crystal_plasticity, "twin_reorientation_angle_deg", 86.3))
-        r_parent = _bunge_euler_matrix(euler, device=device, dtype=dtype)
-        q_tw = _axis_angle_matrix(tw_axis, tw_ang, device=device, dtype=dtype)
+        r_parent = bunge_euler_matrix(euler, device=device, dtype=dtype)
+        q_tw = axis_angle_matrix(tw_axis, tw_ang, device=device, dtype=dtype)
         r_twin = q_tw @ r_parent
 
         sx_m: List[torch.Tensor] = []
@@ -134,31 +56,27 @@ class CrystalPlasticityModel:
         sy_t: List[torch.Tensor] = []
         nx_t: List[torch.Tensor] = []
         ny_t: List[torch.Tensor] = []
+        c_over_a = float(getattr(cfg.crystal_plasticity, "hcp_c_over_a", 1.624))
 
         for s in self.systems:
-            if "s_crystal" in s and "n_crystal" in s:
-                sc = _normalize_vec3(torch.tensor([float(v) for v in s["s_crystal"]], device=device, dtype=dtype))
-                nc = _normalize_vec3(torch.tensor([float(v) for v in s["n_crystal"]], device=device, dtype=dtype))
-            elif "direction_angle_deg" in s and "normal_angle_deg" in s:
-                d = torch.deg2rad(torch.tensor(float(s["direction_angle_deg"]), device=device, dtype=dtype))
-                n = torch.deg2rad(torch.tensor(float(s["normal_angle_deg"]), device=device, dtype=dtype))
-                sc = torch.tensor([torch.cos(d).item(), torch.sin(d).item(), 0.0], device=device, dtype=dtype)
-                nc = torch.tensor([torch.cos(n).item(), torch.sin(n).item(), 0.0], device=device, dtype=dtype)
-                sc = _normalize_vec3(sc)
-                nc = _normalize_vec3(nc)
-            else:
-                raise ValueError(f"Slip system '{s.get('name', 'unknown')}' missing s_crystal/n_crystal or angle fields.")
+            sc, nc = resolve_system_pair_crystal(
+                s,
+                c_over_a=c_over_a,
+                device=device,
+                dtype=dtype,
+            )
+            sc, nc = orthonormalize_pair(sc, nc)
 
             sp = r_parent @ sc
             np_ = r_parent @ nc
             st = r_twin @ sc
             nt = r_twin @ nc
-            a, b, c, d = _project_pair_to_xy(sp, np_)
+            a, b, c, d = project_pair_to_xy(sp, np_, device=device, dtype=dtype)
             sx_m.append(a)
             sy_m.append(b)
             nx_m.append(c)
             ny_m.append(d)
-            a, b, c, d = _project_pair_to_xy(st, nt)
+            a, b, c, d = project_pair_to_xy(st, nt, device=device, dtype=dtype)
             sx_t.append(a)
             sy_t.append(b)
             nx_t.append(c)
@@ -287,11 +205,14 @@ class CrystalPlasticityModel:
         epsp_dot_yy = torch.sum(gamma_dot * p_yy, dim=1, keepdim=True)
         epsp_dot_xy = torch.sum(gamma_dot * p_xy, dim=1, keepdim=True)
 
-        tr = epsp_dot_xx + epsp_dot_yy
-        dev_xx = epsp_dot_xx - tr / 3.0
-        dev_yy = epsp_dot_yy - tr / 3.0
-        dev_zz = -tr / 3.0
-        j2 = 0.5 * (dev_xx * dev_xx + dev_yy * dev_yy + dev_zz * dev_zz + 2.0 * epsp_dot_xy * epsp_dot_xy)
+        # 塑性不可压近似：epsp_dot_zz = -(epsp_dot_xx + epsp_dot_yy)。
+        epsp_dot_zz = -(epsp_dot_xx + epsp_dot_yy)
+        j2 = 0.5 * (
+            epsp_dot_xx * epsp_dot_xx
+            + epsp_dot_yy * epsp_dot_yy
+            + epsp_dot_zz * epsp_dot_zz
+            + 2.0 * epsp_dot_xy * epsp_dot_xy
+        )
         epspeq_dot = torch.sqrt(torch.clamp(2.0 * j2 / 3.0, min=0.0))
         epspeq_dot = torch.nan_to_num(epspeq_dot, nan=0.0, posinf=1e6, neginf=0.0)
 

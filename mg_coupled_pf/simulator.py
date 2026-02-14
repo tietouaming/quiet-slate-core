@@ -104,18 +104,16 @@ class CoupledSimulator:
         self.diffusion_dt_limit_s = self._estimate_diffusion_dt_limit()
         self._diffusion_stage_cache: Dict[float, List[float]] = {}
 
-        ang_s = torch.deg2rad(torch.tensor(cfg.twinning.twin_shear_dir_angle_deg, device=self.device, dtype=self.dtype))
-        ang_n = torch.deg2rad(torch.tensor(cfg.twinning.twin_plane_normal_angle_deg, device=self.device, dtype=self.dtype))
-        self.twin_sx = torch.cos(ang_s)
-        self.twin_sy = torch.sin(ang_s)
-        self.twin_nx = torch.cos(ang_n)
-        self.twin_ny = torch.sin(ang_n)
-
         self.state = initial_fields(cfg, self.grid)
         self.couplers = build_couplers(cfg)
         self.cp = CrystalPlasticityModel(cfg, self.device, self.dtype)
         self.cp_state = self.cp.init_state(cfg.domain.ny, cfg.domain.nx)
         self.mech = MechanicsModel(cfg)
+        # 与力学/CP一致：孪晶系由晶体学定义+取向旋转得到，不再使用固定实验室角度。
+        self.twin_sx = torch.tensor(float(self.mech.sx), device=self.device, dtype=self.dtype)
+        self.twin_sy = torch.tensor(float(self.mech.sy), device=self.device, dtype=self.dtype)
+        self.twin_nx = torch.tensor(float(self.mech.nx), device=self.device, dtype=self.dtype)
+        self.twin_ny = torch.tensor(float(self.mech.ny), device=self.device, dtype=self.dtype)
         self.pitting_field = pitting_mobility_field(cfg, self.grid)
         self.surrogate_field_scales = build_surrogate_field_scales(cfg)
         self.mech_input_scales, self.mech_output_scales = build_mechanics_field_scales(cfg)

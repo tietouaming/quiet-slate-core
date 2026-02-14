@@ -24,6 +24,9 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import yaml
+import torch
+
+from .crystallography import orthonormalize_pair, resolve_system_pair_crystal
 
 
 @dataclass
@@ -193,6 +196,13 @@ class TwinningConfig:
     # 几何孪晶剪切幅值（Mg {10-12} 扩展孪晶常见量级约 0.129）。
     gamma_twin: float = 0.129
     twin_crss_MPa: float = 30.0
+    # HCP 晶体学参数（用于四指数系统转换）。
+    twin_hcp_c_over_a: float = 1.624
+    # 孪晶系统文件（晶体坐标），支持 s_crystal/n_crystal 或 direction_mb/plane_mb。
+    twin_systems_file: str = "configs/twin_systems_hcp_3d.json"
+    # 单序参量模型当前仅使用一个变体，可通过索引选择。
+    twin_variant_index: int = 0
+    # 旧版实验室角度定义（仅兼容回退，不建议作为默认物理路径）。
     twin_shear_dir_angle_deg: float = 35.0
     twin_plane_normal_angle_deg: float = 125.0
     scale_twin_gradient_by_hphi: bool = True
@@ -217,6 +227,8 @@ class CrystalPlasticityConfig:
     basal_crss_MPa: float = 13.0
     prismatic_crss_MPa: float = 57.0
     pyramidal_crss_MPa: float = 100.0
+    # HCP 晶格 c/a（用于四指数转换）。
+    hcp_c_over_a: float = 1.624
     # 孪晶-母相强度学耦合（最小可用版本）：
     # 通过 eta->f_twin 插值对 CRSS 与硬化速率做相依赖缩放。
     use_phase_dependent_strength: bool = True
@@ -391,6 +403,7 @@ class SimulationConfig:
     extensions: ExtensionsConfig = field(default_factory=ExtensionsConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     slip_systems: List[Dict[str, Any]] = field(default_factory=list)
+    twin_systems: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def _deep_update(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
@@ -410,25 +423,25 @@ def _filter_dataclass_kwargs(dc_type, payload: Dict[str, Any]) -> Dict[str, Any]
 
 
 def default_slip_systems_hcp_3d() -> List[Dict[str, Any]]:
-    """返回 3D 晶体学定义的默认 HCP 滑移系集合（投影到 2D 使用）。"""
+    """返回默认 HCP 滑移系（四指数定义，可根据 c/a 转换）。"""
     systems: List[Dict[str, Any]] = []
-    # basal <a>，法向沿 c 轴。
-    basal_dirs = [
-        [1.0, 0.0, 0.0],
-        [-0.5, 0.8660254, 0.0],
-        [-0.5, -0.8660254, 0.0],
+    # basal: (0001)<a>
+    basal_defs = [
+        ([2, -1, -1, 0], [0, 0, 0, 1]),
+        ([-1, 2, -1, 0], [0, 0, 0, 1]),
+        ([-1, -1, 2, 0], [0, 0, 0, 1]),
     ]
-    for i, s in enumerate(basal_dirs, start=1):
-        systems.append({"name": f"basal_{i}", "family": "basal", "s_crystal": s, "n_crystal": [0.0, 0.0, 1.0]})
-    # prismatic <a>，棱柱面法向位于 basal 面内。
+    for i, (d, p) in enumerate(basal_defs, start=1):
+        systems.append({"name": f"basal_{i}", "family": "basal", "direction_mb": d, "plane_mb": p})
+    # prismatic: {10-10}<a>
     prismatic_defs = [
-        ([0.0, 1.0, 0.0], [1.0, 0.0, 0.0]),
-        ([-0.8660254, -0.5, 0.0], [-0.5, 0.8660254, 0.0]),
-        ([0.8660254, -0.5, 0.0], [-0.5, -0.8660254, 0.0]),
+        ([1, -2, 1, 0], [1, 0, -1, 0]),
+        ([-2, 1, 1, 0], [0, 1, -1, 0]),
+        ([1, 1, -2, 0], [-1, 1, 0, 0]),
     ]
-    for i, (s, n) in enumerate(prismatic_defs, start=1):
-        systems.append({"name": f"prismatic_{i}", "family": "prismatic", "s_crystal": s, "n_crystal": n})
-    # pyramidal <c+a>（简化 3D 定义，保持 s·n=0 且含 c 分量）。
+    for i, (d, p) in enumerate(prismatic_defs, start=1):
+        systems.append({"name": f"prismatic_{i}", "family": "prismatic", "direction_mb": d, "plane_mb": p})
+    # pyramidal <c+a>：保留可运行默认向量，并在加载时执行正交化。
     pyramidal_defs = [
         ([0.7, 0.0, 0.714], [0.0, 0.917, -0.399]),
         ([0.35, 0.606, 0.714], [-0.794, 0.458, -0.399]),
@@ -442,13 +455,67 @@ def default_slip_systems_hcp_3d() -> List[Dict[str, Any]]:
     return systems
 
 
-def _load_slip_systems(path: Path) -> List[Dict[str, Any]]:
+def default_twin_systems_hcp_3d() -> List[Dict[str, Any]]:
+    """返回默认孪晶系统（晶体坐标定义）。"""
+    # 当前单序参量模型默认使用第一个变体；提供第二个便于后续多变体扩展。
+    return [
+        {
+            "name": "ext_twin_1",
+            "direction_mb": [0, -2, 2, 1],
+            "plane_mb": [1, 0, -1, 2],
+        },
+        {
+            "name": "ext_twin_2",
+            "direction_mb": [-2, 0, 2, 1],
+            "plane_mb": [0, 1, -1, 2],
+        },
+    ]
+
+
+def _canonicalize_system_entries(
+    entries: List[Dict[str, Any]],
+    *,
+    c_over_a: float,
+    infer_family: bool = False,
+) -> List[Dict[str, Any]]:
+    """统一系统条目为正交归一的 s_crystal/n_crystal。"""
+    out: List[Dict[str, Any]] = []
+    dev = torch.device("cpu")
+    dt = torch.float64
+    for i, e in enumerate(entries):
+        item = dict(e)
+        s, n = resolve_system_pair_crystal(item, c_over_a=c_over_a, device=dev, dtype=dt)
+        s, n = orthonormalize_pair(s, n)
+        item["s_crystal"] = [float(s[0].item()), float(s[1].item()), float(s[2].item())]
+        item["n_crystal"] = [float(n[0].item()), float(n[1].item()), float(n[2].item())]
+        if infer_family and "family" not in item:
+            nm = str(item.get("name", f"sys_{i}")).lower()
+            if "basal" in nm:
+                item["family"] = "basal"
+            elif "prismatic" in nm:
+                item["family"] = "prismatic"
+            else:
+                item["family"] = "pyramidal"
+        out.append(item)
+    return out
+
+
+def _load_slip_systems(path: Path, *, c_over_a: float) -> List[Dict[str, Any]]:
     """从 JSON 读取滑移系；若文件不存在则使用内置默认值。"""
     if path.exists():
-        # 用户显式提供时，完全以外部文件为准。
-        return json.loads(path.read_text(encoding="utf-8"))
-    # 回退到内置默认滑移系，保证最小可运行。
-    return default_slip_systems_hcp_3d()
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    else:
+        raw = default_slip_systems_hcp_3d()
+    return _canonicalize_system_entries(raw, c_over_a=c_over_a, infer_family=True)
+
+
+def _load_twin_systems(path: Path, *, c_over_a: float) -> List[Dict[str, Any]]:
+    """从 JSON 读取孪晶系；若文件不存在则使用内置默认值。"""
+    if path.exists():
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    else:
+        raw = default_twin_systems_hcp_3d()
+    return _canonicalize_system_entries(raw, c_over_a=c_over_a, infer_family=False)
 
 
 def load_config(config_path: str | Path | None = None) -> SimulationConfig:
@@ -490,6 +557,8 @@ def load_config(config_path: str | Path | None = None) -> SimulationConfig:
         cfg.extensions = ExtensionsConfig(**_filter_dataclass_kwargs(ExtensionsConfig, merged["extensions"]))
         cfg.runtime = RuntimeConfig(**_filter_dataclass_kwargs(RuntimeConfig, merged["runtime"]))
     slip_path = Path(cfg.crystal_plasticity.slip_systems_file)
-    # 最终统一加载滑移系（JSON 或默认）。
-    cfg.slip_systems = _load_slip_systems(slip_path)
+    twin_path = Path(cfg.twinning.twin_systems_file)
+    # 最终统一加载系统定义（JSON 或默认），并做正交化校验。
+    cfg.slip_systems = _load_slip_systems(slip_path, c_over_a=float(cfg.crystal_plasticity.hcp_c_over_a))
+    cfg.twin_systems = _load_twin_systems(twin_path, c_over_a=float(cfg.twinning.twin_hcp_c_over_a))
     return cfg
