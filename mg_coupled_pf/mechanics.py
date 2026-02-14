@@ -139,6 +139,44 @@ def _extract_plane_strain_coeffs(c: torch.Tensor) -> Dict[str, float]:
     return out
 
 
+def _extract_plane_stress_coeffs(c: torch.Tensor) -> Dict[str, float]:
+    """提取二维平面应力使用的应力-应变线性系数。
+
+    约束为 `sigma_zz=0`（并假设 eps_xz=eps_yz=0），对 eps_zz 做 Schur 消元。
+    本函数中的 `*_exy` 系数对应张量应变 `eps_xy`（非工程剪应变）。
+    """
+    c33 = float(c[2, 2, 2, 2].item())
+    if abs(c33) < 1e-12:
+        c33 = 1e-12
+
+    def coeff(i: int, j: int, k: int, l: int) -> float:
+        return float(c[i, j, k, l].item())
+
+    # ezz = -(Czz_xx*exx + Czz_yy*eyy + 2*Czz_xy*exy) / Czz_zz
+    ezz_exx = -coeff(2, 2, 0, 0) / c33
+    ezz_eyy = -coeff(2, 2, 1, 1) / c33
+    ezz_exy = -2.0 * coeff(2, 2, 0, 1) / c33
+
+    out: Dict[str, float] = {}
+    # sigma_xx
+    out["xx_exx"] = coeff(0, 0, 0, 0) + coeff(0, 0, 2, 2) * ezz_exx
+    out["xx_eyy"] = coeff(0, 0, 1, 1) + coeff(0, 0, 2, 2) * ezz_eyy
+    out["xx_exy"] = 2.0 * coeff(0, 0, 0, 1) + coeff(0, 0, 2, 2) * ezz_exy
+    # sigma_yy
+    out["yy_exx"] = coeff(1, 1, 0, 0) + coeff(1, 1, 2, 2) * ezz_exx
+    out["yy_eyy"] = coeff(1, 1, 1, 1) + coeff(1, 1, 2, 2) * ezz_eyy
+    out["yy_exy"] = 2.0 * coeff(1, 1, 0, 1) + coeff(1, 1, 2, 2) * ezz_exy
+    # sigma_xy
+    out["xy_exx"] = coeff(0, 1, 0, 0) + coeff(0, 1, 2, 2) * ezz_exx
+    out["xy_eyy"] = coeff(0, 1, 1, 1) + coeff(0, 1, 2, 2) * ezz_eyy
+    out["xy_exy"] = 2.0 * coeff(0, 1, 0, 1) + coeff(0, 1, 2, 2) * ezz_exy
+    # 平面应力条件下 sigma_zz 恒为 0。
+    out["zz_exx"] = 0.0
+    out["zz_eyy"] = 0.0
+    out["zz_exy"] = 0.0
+    return out
+
+
 class MechanicsModel:
     """准静态力学求解器。"""
 
@@ -168,8 +206,12 @@ class MechanicsModel:
             r_twin = _axis_angle_matrix(tw_axis, tw_ang) @ r_parent
             c_parent = _rotate_stiffness(c0, r_parent)
             c_twin = _rotate_stiffness(c0, r_twin)
-            self._c_parent_coeffs = _extract_plane_strain_coeffs(c_parent)
-            self._c_twin_coeffs = _extract_plane_strain_coeffs(c_twin)
+            if bool(cfg.mechanics.plane_strain):
+                self._c_parent_coeffs = _extract_plane_strain_coeffs(c_parent)
+                self._c_twin_coeffs = _extract_plane_strain_coeffs(c_twin)
+            else:
+                self._c_parent_coeffs = _extract_plane_stress_coeffs(c_parent)
+                self._c_twin_coeffs = _extract_plane_stress_coeffs(c_twin)
             # 线性求解器预条件的刚度参考值取主要系数上界，提升各向异性下的鲁棒性。
             cand: List[float] = []
             for coeffs in [self._c_parent_coeffs, self._c_twin_coeffs]:
@@ -276,35 +318,51 @@ class MechanicsModel:
             if self.anisotropic_blend_with_twin and (eta is not None) and (self._c_twin_coeffs is not None):
                 sxx_t, syy_t, sxy_t, szz_t = compose_from_coeffs(self._c_twin_coeffs)
                 wt = smooth_heaviside(torch.clamp(eta, 0.0, 1.0))
-                sigma_xx = (1.0 - wt) * sxx_m + wt * sxx_t
-                sigma_yy = (1.0 - wt) * syy_m + wt * syy_t
-                sigma_xy = (1.0 - wt) * sxy_m + wt * sxy_t
-                sigma_zz = (1.0 - wt) * szz_m + wt * szz_t
+                sigma_xx_solid = (1.0 - wt) * sxx_m + wt * sxx_t
+                sigma_yy_solid = (1.0 - wt) * syy_m + wt * syy_t
+                sigma_xy_solid = (1.0 - wt) * sxy_m + wt * sxy_t
+                sigma_zz_solid = (1.0 - wt) * szz_m + wt * szz_t
             else:
-                sigma_xx, sigma_yy, sigma_xy, sigma_zz = sxx_m, syy_m, sxy_m, szz_m
-            if not bool(self.cfg.mechanics.plane_strain):
-                sigma_zz = torch.zeros_like(sigma_xx)
-            sigma_xx = hphi * sigma_xx
-            sigma_yy = hphi * sigma_yy
-            sigma_xy = hphi * sigma_xy
-            sigma_zz = hphi * sigma_zz
+                sigma_xx_solid, sigma_yy_solid, sigma_xy_solid, sigma_zz_solid = sxx_m, syy_m, sxy_m, szz_m
+            sigma_xx = hphi * sigma_xx_solid
+            sigma_yy = hphi * sigma_yy_solid
+            sigma_xy = hphi * sigma_xy_solid
+            sigma_zz = hphi * sigma_zz_solid
         else:
-            tr = eps_xx + eps_yy
-            sigma_xx = hphi * (self.lam * tr + 2.0 * self.mu * eps_xx)
-            sigma_yy = hphi * (self.lam * tr + 2.0 * self.mu * eps_yy)
-            sigma_xy = hphi * (2.0 * self.mu * eps_xy)
             if bool(self.cfg.mechanics.plane_strain):
+                tr = eps_xx + eps_yy
+                sigma_xx_solid = self.lam * tr + 2.0 * self.mu * eps_xx
+                sigma_yy_solid = self.lam * tr + 2.0 * self.mu * eps_yy
+                sigma_xy_solid = 2.0 * self.mu * eps_xy
                 # 平面应变下 ezz=0，但 szz=lambda*(exx+eyy) 一般不为 0。
-                sigma_zz = hphi * (self.lam * tr)
+                sigma_zz_solid = self.lam * tr
             else:
-                sigma_zz = torch.zeros_like(sigma_xx)
+                # 平面应力：sigma_zz=0，需由平面应力本构计算 sigma_xx/sigma_yy。
+                den = max(self.lam + self.mu, 1e-12)
+                nu = self.lam / (2.0 * den)
+                e = self.mu * (3.0 * self.lam + 2.0 * self.mu) / den
+                pref = e / max(1.0 - nu * nu, 1e-12)
+                sigma_xx_solid = pref * (eps_xx + nu * eps_yy)
+                sigma_yy_solid = pref * (eps_yy + nu * eps_xx)
+                sigma_xy_solid = 2.0 * self.mu * eps_xy
+                sigma_zz_solid = torch.zeros_like(sigma_xx_solid)
+            sigma_xx = hphi * sigma_xx_solid
+            sigma_yy = hphi * sigma_yy_solid
+            sigma_xy = hphi * sigma_xy_solid
+            sigma_zz = hphi * sigma_zz_solid
         sigma_h = (sigma_xx + sigma_yy + sigma_zz) / 3.0
+        sigma_h_solid = (sigma_xx_solid + sigma_yy_solid + sigma_zz_solid) / 3.0
         return {
             "sigma_xx": sigma_xx,
             "sigma_yy": sigma_yy,
             "sigma_xy": sigma_xy,
             "sigma_zz": sigma_zz,
             "sigma_h": sigma_h,
+            "sigma_xx_solid": sigma_xx_solid,
+            "sigma_yy_solid": sigma_yy_solid,
+            "sigma_xy_solid": sigma_xy_solid,
+            "sigma_zz_solid": sigma_zz_solid,
+            "sigma_h_solid": sigma_h_solid,
         }
 
     def _apply_displacement_constraints(self, ux: torch.Tensor, uy: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

@@ -825,3 +825,75 @@ def test_mechanics_anisotropic_twin_blend_changes_stress() -> None:
     s1 = mech.constitutive_stress(phi, ex, ey, exy, eta=eta1)
     delta = float(torch.mean(torch.abs(s1["sigma_xx"] - s0["sigma_xx"])).item())
     assert delta > 1e-4
+
+
+def test_omega_kappa_phi_respects_tanh_half_width_convention() -> None:
+    """interface_thickness_definition=tanh_half_width 时应使用解析定标关系。"""
+    cfg = load_config("configs/notch_case.yaml")
+    cfg.corrosion.gamma_J_m2 = 0.5
+    cfg.corrosion.interface_thickness_um = 2.5
+    cfg.corrosion.interface_thickness_definition = "tanh_half_width"
+    sim = CoupledSimulator(cfg)
+    omega, kappa = sim._omega_kappa_phi()
+    ell_m = cfg.corrosion.interface_thickness_um * 1e-6
+    omega_ref = 3.0 * cfg.corrosion.gamma_J_m2 / (8.0 * ell_m) / 1e6
+    kappa_ref = 3.0 * cfg.corrosion.gamma_J_m2 * ell_m / 1e6
+    assert abs(omega - omega_ref) / max(abs(omega_ref), 1e-12) < 1e-10
+    assert abs(kappa - kappa_ref) / max(abs(kappa_ref), 1e-12) < 1e-10
+
+
+def test_corrosion_mobility_uses_solid_sigma_when_enabled() -> None:
+    """开启 use_solid_sigma_for_corrosion 后，应优先使用未掩膜固相应力。"""
+    cfg = load_config("configs/notch_case.yaml")
+    cfg.ml.enabled = False
+    sim = CoupledSimulator(cfg)
+    st = {k: v.clone() for k, v in sim.state.items()}
+    mech = {
+        "sigma_h": torch.zeros_like(st["phi"]),
+        "sigma_h_solid": torch.full_like(st["phi"], 120.0),
+    }
+    cfg.corrosion.use_solid_sigma_for_corrosion = False
+    l_masked = sim._corrosion_mobility(state=st, mech=mech)
+    cfg.corrosion.use_solid_sigma_for_corrosion = True
+    l_solid = sim._corrosion_mobility(state=st, mech=mech)
+    assert float(torch.mean(l_solid - l_masked).item()) > 0.0
+
+
+def test_total_epspeq_dot_includes_twin_rate_component() -> None:
+    """总等效塑性速率应包含孪晶转变应变速率贡献。"""
+    cfg = load_config("configs/notch_case.yaml")
+    cfg.runtime.device = "cpu"
+    cfg.domain.nx = 48
+    cfg.domain.ny = 32
+    cfg.numerics.n_steps = 1
+    cfg.numerics.dt_s = 2e-4
+    cfg.ml.enabled = False
+    # 关闭滑移塑性，仅保留孪晶项，便于验证分解逻辑。
+    cfg.crystal_plasticity.gamma0_s_inv = 0.0
+    cfg.twinning.twin_crss_MPa = -1e6
+    cfg.twinning.nucleation_source_amp = 2e-3
+    cfg.corrosion.epspeq_twin_weight = 1.0
+
+    sim = CoupledSimulator(cfg)
+    sim.step(1)
+    twin_dot = sim.state["epspeq_dot_twin"]
+    slip_dot = sim.state["epspeq_dot_slip"]
+    total_dot = sim.state["epspeq_dot"]
+    assert float(torch.mean(twin_dot).item()) > 0.0
+    assert float(torch.max(torch.abs(slip_dot)).item()) < 1e-10
+    assert float(torch.mean(torch.abs(total_dot - twin_dot)).item()) < 1e-8
+
+
+def test_mechanics_anisotropic_plane_stress_enforces_sigma_zz_zero() -> None:
+    """各向异性平面应力分支应满足 sigma_zz=0（通过 Schur 消元）。"""
+    cfg = load_config("configs/notch_case.yaml")
+    cfg.mechanics.use_anisotropic_hcp = True
+    cfg.mechanics.plane_strain = False
+    mech = MechanicsModel(cfg)
+    phi = torch.ones((1, 1, 4, 5), dtype=torch.float32)
+    eta = torch.zeros_like(phi)
+    ex = torch.full_like(phi, 0.004)
+    ey = torch.full_like(phi, -0.001)
+    exy = torch.full_like(phi, 0.0015)
+    sig = mech.constitutive_stress(phi, ex, ey, exy, eta=eta)
+    assert float(torch.max(torch.abs(sig["sigma_zz_solid"])).item()) < 1e-8

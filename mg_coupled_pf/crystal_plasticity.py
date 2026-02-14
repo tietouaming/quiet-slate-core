@@ -121,7 +121,16 @@ class CrystalPlasticityModel:
         """初始化内部变量状态（g 与累计滑移）。"""
         g = self.crss0.expand(1, self.n_sys, ny, nx).clone()
         gamma = torch.zeros_like(g)
-        return {"g": g, "gamma_accum": gamma}
+        return {
+            # 兼容旧字段：g / gamma_accum 作为“混合视图”保留。
+            "g": g.clone(),
+            "gamma_accum": gamma.clone(),
+            # 新字段：母晶/孪晶分相硬化历史。
+            "g_parent": g.clone(),
+            "g_twin": g.clone(),
+            "gamma_accum_parent": gamma.clone(),
+            "gamma_accum_twin": gamma.clone(),
+        }
 
     def _effective_schmid_tensors(self, eta: torch.Tensor) -> Dict[str, torch.Tensor]:
         """在基体/孪晶两组 Schmid 张量间做体积分数混合。"""
@@ -142,68 +151,103 @@ class CrystalPlasticityModel:
         material_overrides: Dict[str, torch.Tensor] | None = None,
     ) -> Dict[str, torch.Tensor]:
         """执行一个时间步的晶体塑性更新。"""
-        g = cp_state["g"]
-        schmid = self._effective_schmid_tensors(eta)
-        p_xx, p_yy, p_xy = schmid["p_xx"], schmid["p_yy"], schmid["p_xy"]
+        g_parent = cp_state.get("g_parent", cp_state["g"])
+        g_twin = cp_state.get("g_twin", cp_state["g"])
+        gamma_accum_parent = cp_state.get("gamma_accum_parent", cp_state["gamma_accum"])
+        gamma_accum_twin = cp_state.get("gamma_accum_twin", cp_state["gamma_accum"])
         f_twin = smooth_heaviside(torch.clamp(eta, 0.0, 1.0))
+        f_parent = 1.0 - f_twin
+
+        # 分别计算母晶/孪晶的 Schmid 张量响应。
+        p_xx_m = self.pxx_m.view(1, self.n_sys, 1, 1)
+        p_yy_m = self.pyy_m.view(1, self.n_sys, 1, 1)
+        p_xy_m = self.pxy_m.view(1, self.n_sys, 1, 1)
+        p_xx_t = self.pxx_t.view(1, self.n_sys, 1, 1)
+        p_yy_t = self.pyy_t.view(1, self.n_sys, 1, 1)
+        p_xy_t = self.pxy_t.view(1, self.n_sys, 1, 1)
 
         # 分解剪应力 tau = P:σ，其中 P_xy 分量按工程应力需乘 2。
-        tau = p_xx * sigma_xx + p_yy * sigma_yy + 2.0 * p_xy * sigma_xy
+        tau_m = p_xx_m * sigma_xx + p_yy_m * sigma_yy + 2.0 * p_xy_m * sigma_xy
+        tau_t = p_xx_t * sigma_xx + p_yy_t * sigma_yy + 2.0 * p_xy_t * sigma_xy
 
         gamma0 = self.cfg.crystal_plasticity.gamma0_s_inv
         m = self.cfg.crystal_plasticity.m_rate_sensitivity
-        g_eff = torch.clamp(g, min=1e-6)
-        h_scale = torch.ones_like(g_eff)
+        m_scale = 1.0
+        t_scale = 1.0
+        h_m_scale = 1.0
+        h_t_scale = 1.0
         if bool(getattr(self.cfg.crystal_plasticity, "use_phase_dependent_strength", True)):
             m_scale = float(getattr(self.cfg.crystal_plasticity, "matrix_crss_scale", 1.0))
             t_scale = float(getattr(self.cfg.crystal_plasticity, "twin_crss_scale", 1.0))
-            mh = float(getattr(self.cfg.crystal_plasticity, "matrix_hardening_scale", 1.0))
-            th = float(getattr(self.cfg.crystal_plasticity, "twin_hardening_scale", 1.0))
-            crss_scale = (1.0 - f_twin) * m_scale + f_twin * t_scale
-            h_scale = (1.0 - f_twin) * mh + f_twin * th
-            g_eff = g_eff * torch.clamp(crss_scale, min=1e-3, max=1e3)
+            h_m_scale = float(getattr(self.cfg.crystal_plasticity, "matrix_hardening_scale", 1.0))
+            h_t_scale = float(getattr(self.cfg.crystal_plasticity, "twin_hardening_scale", 1.0))
 
         yield_scale = 1.0
         if material_overrides and "yield_scale" in material_overrides:
             yield_scale = material_overrides["yield_scale"]
-        g_eff = g_eff * yield_scale
+        g_eff_m = torch.clamp(g_parent * float(m_scale) * yield_scale, min=1e-6)
+        g_eff_t = torch.clamp(g_twin * float(t_scale) * yield_scale, min=1e-6)
 
-        ratio = tau / g_eff
-        ratio = torch.clamp(ratio, min=-8.0, max=8.0)
+        ratio_m = torch.clamp(tau_m / g_eff_m, min=-8.0, max=8.0)
+        ratio_t = torch.clamp(tau_t / g_eff_t, min=-8.0, max=8.0)
         plastic_active = True
         if self.cfg.crystal_plasticity.use_overstress:
-            abs_over = torch.clamp(torch.abs(ratio) - 1.0, min=0.0)
-            if self.cfg.crystal_plasticity.elastic_shortcut and float(torch.max(abs_over).item()) <= 0.0:
+            abs_over_m = torch.clamp(torch.abs(ratio_m) - 1.0, min=0.0)
+            abs_over_t = torch.clamp(torch.abs(ratio_t) - 1.0, min=0.0)
+            if self.cfg.crystal_plasticity.elastic_shortcut and float(torch.max(torch.maximum(abs_over_m, abs_over_t)).item()) <= 0.0:
                 z = torch.zeros_like(sigma_xx)
+                tau_mix = f_parent * tau_m + f_twin * tau_t
+                g_mix = f_parent * g_parent + f_twin * g_twin
+                ga_mix = f_parent * gamma_accum_parent + f_twin * gamma_accum_twin
                 return {
-                    "g": g,
-                    "gamma_accum": cp_state["gamma_accum"],
+                    "g": g_mix,
+                    "gamma_accum": ga_mix,
+                    "g_parent": g_parent,
+                    "g_twin": g_twin,
+                    "gamma_accum_parent": gamma_accum_parent,
+                    "gamma_accum_twin": gamma_accum_twin,
                     "epsp_dot_xx": z,
                     "epsp_dot_yy": z,
                     "epsp_dot_xy": z,
                     "epspeq_dot": z,
-                    "tau": tau,
+                    "tau": tau_mix,
                     "plastic_active": False,
                 }
-            gamma_dot = gamma0 * torch.sign(ratio) * torch.pow(abs_over, m)
+            gamma_dot_m = gamma0 * torch.sign(ratio_m) * torch.pow(abs_over_m, m)
+            gamma_dot_t = gamma0 * torch.sign(ratio_t) * torch.pow(abs_over_t, m)
         else:
-            gamma_dot = gamma0 * torch.sign(ratio) * torch.pow(torch.abs(ratio), m)
-        gamma_dot = torch.nan_to_num(gamma_dot, nan=0.0, posinf=0.0, neginf=0.0)
+            gamma_dot_m = gamma0 * torch.sign(ratio_m) * torch.pow(torch.abs(ratio_m), m)
+            gamma_dot_t = gamma0 * torch.sign(ratio_t) * torch.pow(torch.abs(ratio_t), m)
+        gamma_dot_m = torch.nan_to_num(gamma_dot_m, nan=0.0, posinf=0.0, neginf=0.0)
+        gamma_dot_t = torch.nan_to_num(gamma_dot_t, nan=0.0, posinf=0.0, neginf=0.0)
         cap = max(self.cfg.crystal_plasticity.gamma_dot_max_s_inv, 1e-6)
-        gamma_dot = torch.clamp(gamma_dot, min=-cap, max=cap)
+        gamma_dot_m = torch.clamp(gamma_dot_m, min=-cap, max=cap)
+        gamma_dot_t = torch.clamp(gamma_dot_t, min=-cap, max=cap)
 
-        abs_gamma = torch.abs(gamma_dot)
-        abs_perm = abs_gamma.permute(0, 2, 3, 1)
-        dg_perm = torch.matmul(abs_perm, self.q_hardening.T) * self.cfg.crystal_plasticity.h_MPa
-        dg = dg_perm.permute(0, 3, 1, 2)
-        dg = dg * torch.clamp(h_scale, min=1e-3, max=1e3)
+        abs_gamma_m = torch.abs(gamma_dot_m)
+        abs_gamma_t = torch.abs(gamma_dot_t)
+        abs_perm_m = abs_gamma_m.permute(0, 2, 3, 1)
+        abs_perm_t = abs_gamma_t.permute(0, 2, 3, 1)
+        dg_perm_m = torch.matmul(abs_perm_m, self.q_hardening.T) * self.cfg.crystal_plasticity.h_MPa
+        dg_perm_t = torch.matmul(abs_perm_t, self.q_hardening.T) * self.cfg.crystal_plasticity.h_MPa
+        dg_m = dg_perm_m.permute(0, 3, 1, 2) * max(float(h_m_scale), 1e-3)
+        dg_t = dg_perm_t.permute(0, 3, 1, 2) * max(float(h_t_scale), 1e-3)
         dg_cap = max(self.cfg.crystal_plasticity.hardening_rate_cap_MPa_s, 1e-6)
-        dg = torch.clamp(dg, min=0.0, max=dg_cap)
-        g_new = torch.clamp(g + dt_s * dg, min=1e-3)
+        dg_m = torch.clamp(dg_m, min=0.0, max=dg_cap)
+        dg_t = torch.clamp(dg_t, min=0.0, max=dg_cap)
+        g_parent_new = torch.clamp(g_parent + dt_s * dg_m, min=1e-3)
+        g_twin_new = torch.clamp(g_twin + dt_s * dg_t, min=1e-3)
 
-        epsp_dot_xx = torch.sum(gamma_dot * p_xx, dim=1, keepdim=True)
-        epsp_dot_yy = torch.sum(gamma_dot * p_yy, dim=1, keepdim=True)
-        epsp_dot_xy = torch.sum(gamma_dot * p_xy, dim=1, keepdim=True)
+        # 母晶/孪晶分别求解塑性应变率，再按体积分数平滑混合。
+        epsp_dot_xx_m = torch.sum(gamma_dot_m * p_xx_m, dim=1, keepdim=True)
+        epsp_dot_yy_m = torch.sum(gamma_dot_m * p_yy_m, dim=1, keepdim=True)
+        epsp_dot_xy_m = torch.sum(gamma_dot_m * p_xy_m, dim=1, keepdim=True)
+        epsp_dot_xx_t = torch.sum(gamma_dot_t * p_xx_t, dim=1, keepdim=True)
+        epsp_dot_yy_t = torch.sum(gamma_dot_t * p_yy_t, dim=1, keepdim=True)
+        epsp_dot_xy_t = torch.sum(gamma_dot_t * p_xy_t, dim=1, keepdim=True)
+        epsp_dot_xx = f_parent * epsp_dot_xx_m + f_twin * epsp_dot_xx_t
+        epsp_dot_yy = f_parent * epsp_dot_yy_m + f_twin * epsp_dot_yy_t
+        epsp_dot_xy = f_parent * epsp_dot_xy_m + f_twin * epsp_dot_xy_t
 
         # 塑性不可压近似：epsp_dot_zz = -(epsp_dot_xx + epsp_dot_yy)。
         epsp_dot_zz = -(epsp_dot_xx + epsp_dot_yy)
@@ -215,14 +259,23 @@ class CrystalPlasticityModel:
         )
         epspeq_dot = torch.sqrt(torch.clamp(2.0 * j2 / 3.0, min=0.0))
         epspeq_dot = torch.nan_to_num(epspeq_dot, nan=0.0, posinf=1e6, neginf=0.0)
+        tau_mix = f_parent * tau_m + f_twin * tau_t
+        gamma_accum_parent_new = gamma_accum_parent + dt_s * abs_gamma_m
+        gamma_accum_twin_new = gamma_accum_twin + dt_s * abs_gamma_t
+        g_mix = f_parent * g_parent_new + f_twin * g_twin_new
+        ga_mix = f_parent * gamma_accum_parent_new + f_twin * gamma_accum_twin_new
 
         return {
-            "g": g_new,
-            "gamma_accum": cp_state["gamma_accum"] + dt_s * abs_gamma,
+            "g": g_mix,
+            "gamma_accum": ga_mix,
+            "g_parent": g_parent_new,
+            "g_twin": g_twin_new,
+            "gamma_accum_parent": gamma_accum_parent_new,
+            "gamma_accum_twin": gamma_accum_twin_new,
             "epsp_dot_xx": epsp_dot_xx,
             "epsp_dot_yy": epsp_dot_yy,
             "epsp_dot_xy": epsp_dot_xy,
             "epspeq_dot": epspeq_dot,
-            "tau": tau,
+            "tau": tau_mix,
             "plastic_active": plastic_active,
         }

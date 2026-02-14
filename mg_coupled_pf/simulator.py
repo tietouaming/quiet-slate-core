@@ -128,6 +128,10 @@ class CoupledSimulator:
         self.state["epsp_xx"] = self.epsp["exx"].clone()
         self.state["epsp_yy"] = self.epsp["eyy"].clone()
         self.state["epsp_xy"] = self.epsp["exy"].clone()
+        self.state["epspeq_slip"] = self.state.get("epspeq", z).clone()
+        self.state["epspeq_twin"] = torch.zeros_like(self.state["phi"])
+        self.state["epspeq_dot_slip"] = torch.zeros_like(self.state["phi"])
+        self.state["epspeq_dot_twin"] = torch.zeros_like(self.state["phi"])
         self.state["epspeq_dot"] = torch.zeros_like(self.state["phi"])
         self.last_mech = {
             "sigma_xx": z.clone(),
@@ -135,6 +139,11 @@ class CoupledSimulator:
             "sigma_xy": z.clone(),
             "sigma_zz": z.clone(),
             "sigma_h": z.clone(),
+            "sigma_xx_solid": z.clone(),
+            "sigma_yy_solid": z.clone(),
+            "sigma_xy_solid": z.clone(),
+            "sigma_zz_solid": z.clone(),
+            "sigma_h_solid": z.clone(),
         }
 
         self.surrogate = None
@@ -365,8 +374,19 @@ class CoupledSimulator:
             "sigma_xy": torch.nan_to_num(sig["sigma_xy"], nan=0.0, posinf=0.0, neginf=0.0),
             "sigma_zz": torch.nan_to_num(sig["sigma_zz"], nan=0.0, posinf=0.0, neginf=0.0),
             "sigma_h": torch.nan_to_num(sig["sigma_h"], nan=0.0, posinf=0.0, neginf=0.0),
+            "sigma_xx_solid": torch.nan_to_num(sig.get("sigma_xx_solid", sig["sigma_xx"]), nan=0.0, posinf=0.0, neginf=0.0),
+            "sigma_yy_solid": torch.nan_to_num(sig.get("sigma_yy_solid", sig["sigma_yy"]), nan=0.0, posinf=0.0, neginf=0.0),
+            "sigma_xy_solid": torch.nan_to_num(sig.get("sigma_xy_solid", sig["sigma_xy"]), nan=0.0, posinf=0.0, neginf=0.0),
+            "sigma_zz_solid": torch.nan_to_num(sig.get("sigma_zz_solid", sig["sigma_zz"]), nan=0.0, posinf=0.0, neginf=0.0),
+            "sigma_h_solid": torch.nan_to_num(sig.get("sigma_h_solid", sig["sigma_h"]), nan=0.0, posinf=0.0, neginf=0.0),
         }
         return out
+
+    def _update_cp_state_from_out(self, cp_out: Dict[str, torch.Tensor]) -> None:
+        """将 CP 更新输出同步回 cp_state（兼容单/双硬化变量版本）。"""
+        for k in ("g", "gamma_accum", "g_parent", "g_twin", "gamma_accum_parent", "gamma_accum_twin"):
+            if k in cp_out:
+                self.cp_state[k] = cp_out[k]
 
     def _compute_mechanics_residual(self, mech_state: Dict[str, torch.Tensor], phi: torch.Tensor) -> float:
         """计算 `div(sigma)=0` 的离散残差均值（仅固相统计）。"""
@@ -661,13 +681,15 @@ class CoupledSimulator:
             dt_s=dt_s,
             material_overrides=self._material_overrides(),
         )
-        self.cp_state["g"] = cp_out["g"]
-        self.cp_state["gamma_accum"] = cp_out["gamma_accum"]
-        self.state["epspeq_dot"] = torch.clamp(
+        self._update_cp_state_from_out(cp_out)
+        epsdot_slip = torch.clamp(
             torch.nan_to_num(cp_out["epspeq_dot"], nan=0.0, posinf=0.0, neginf=0.0),
             min=0.0,
             max=1e6,
         )
+        self.state["epspeq_dot_slip"] = epsdot_slip
+        self.state["epspeq_dot_twin"] = torch.zeros_like(epsdot_slip)
+        self.state["epspeq_dot"] = epsdot_slip
         # surrogate 已经给出塑性场时，不在此重复积分 epsp_dot，仅同步内部缓存。
         self.epsp = self._epsp_from_state(self.state)
         self._sync_epsp_to_state()
@@ -1190,9 +1212,30 @@ class CoupledSimulator:
         if ell_um <= 0.0:
             ell_um = float(self.cfg.domain.interface_width_um)
         ell_m = ell_um * 1e-6
-        omega = 3.0 * gamma / (4.0 * ell_m) / 1e6  # MPa
-        kappa = 1.5 * gamma * ell_m / 1e6  # MPa*m^2
+        mode = str(getattr(self.cfg.corrosion, "interface_thickness_definition", "tanh_half_width")).strip().lower()
+        if mode in {"legacy", "legacy_energy_equiv", "legacy_energy_equivalent"}:
+            # 历史定标：与旧版本保持一致。
+            omega = 3.0 * gamma / (4.0 * ell_m) / 1e6  # MPa
+            kappa = 1.5 * gamma * ell_m / 1e6  # MPa*m^2
+        else:
+            # 以 tanh 半宽参数 a=ell 为口径：
+            # a = sqrt(kappa/(8*omega)), gamma = sqrt(8*kappa*omega)/3
+            # => omega = 3*gamma/(8*a), kappa = 3*gamma*a
+            omega = 3.0 * gamma / (8.0 * ell_m) / 1e6  # MPa
+            kappa = 3.0 * gamma * ell_m / 1e6  # MPa*m^2
         return omega, kappa
+
+    @staticmethod
+    def _equivalent_strain_rate(exx_dot: torch.Tensor, eyy_dot: torch.Tensor, exy_dot: torch.Tensor) -> torch.Tensor:
+        """由二维应变率分量计算等效应变率（含不可压 ezz）。"""
+        ezz_dot = -(exx_dot + eyy_dot)
+        j2 = 0.5 * (
+            exx_dot * exx_dot
+            + eyy_dot * eyy_dot
+            + ezz_dot * ezz_dot
+            + 2.0 * exy_dot * exy_dot
+        )
+        return torch.sqrt(torch.clamp(2.0 * j2 / 3.0, min=0.0))
 
     def _material_overrides(self) -> Dict[str, torch.Tensor]:
         """汇总扩展耦合器对材料参数的覆盖项。"""
@@ -1217,7 +1260,11 @@ class CoupledSimulator:
         if l0_unit in {"1_over_pa_s", "1/pa/s", "pa"}:
             # 代码中化学势/能量以 MPa 为标度，若输入 SI(1/Pa/s) 需转为 1/(MPa*s)。
             L0 = L0 * 1e6
-        sigma_h_pa = mech_state["sigma_h"] * 1e6
+        if bool(getattr(c, "use_solid_sigma_for_corrosion", True)):
+            sigma_h_src = mech_state.get("sigma_h_solid", mech_state["sigma_h"])
+        else:
+            sigma_h_src = mech_state["sigma_h"]
+        sigma_h_pa = sigma_h_src * 1e6
         # 机械放大项默认采用“塑性应变率”而非“累计塑性应变”，避免历史量永久放大腐蚀速度。
         if bool(getattr(c, "use_epspeq_rate_for_mobility", True)):
             epsdot = torch.clamp(
@@ -1309,6 +1356,26 @@ class CoupledSimulator:
         self.state["epspeq"] = self.state["epspeq"] * solid
         self.state["epspeq_dot"] = torch.clamp(
             torch.nan_to_num(self.state.get("epspeq_dot", torch.zeros_like(self.state["phi"])), nan=0.0, posinf=0.0, neginf=0.0),
+            0.0,
+            1e6,
+        ) * solid
+        self.state["epspeq_slip"] = torch.clamp(
+            torch.nan_to_num(self.state.get("epspeq_slip", self.state["epspeq"]), nan=0.0, posinf=1e6, neginf=0.0),
+            0.0,
+            1e6,
+        ) * solid
+        self.state["epspeq_twin"] = torch.clamp(
+            torch.nan_to_num(self.state.get("epspeq_twin", torch.zeros_like(self.state["phi"])), nan=0.0, posinf=1e6, neginf=0.0),
+            0.0,
+            1e6,
+        ) * solid
+        self.state["epspeq_dot_slip"] = torch.clamp(
+            torch.nan_to_num(self.state.get("epspeq_dot_slip", torch.zeros_like(self.state["phi"])), nan=0.0, posinf=0.0, neginf=0.0),
+            0.0,
+            1e6,
+        ) * solid
+        self.state["epspeq_dot_twin"] = torch.clamp(
+            torch.nan_to_num(self.state.get("epspeq_dot_twin", torch.zeros_like(self.state["phi"])), nan=0.0, posinf=0.0, neginf=0.0),
             0.0,
             1e6,
         ) * solid
@@ -1578,6 +1645,8 @@ class CoupledSimulator:
                 adaptive_due = adaptive_due or (deta > eta_trig)
         # 仅在指定频率点或触发阈值满足时更新力学。
         do_mech_update = periodic_due or adaptive_due
+        z_like = torch.zeros_like(self.state["phi"])
+        epspeq_dot_slip = z_like
         if do_mech_update:
             if bool(self.cfg.numerics.mechanics_use_ml_initial_guess):
                 # 优先使用“力学专用初值器”；若不存在则回退到通用 surrogate。
@@ -1628,26 +1697,29 @@ class CoupledSimulator:
                 dt_s=dt_s,
                 material_overrides=self._material_overrides(),
             )
-            self.cp_state["g"] = cp_out["g"]
-            self.cp_state["gamma_accum"] = cp_out["gamma_accum"]
+            self._update_cp_state_from_out(cp_out)
             # 1.3 将“应变率”积分到“应变增量”（显式欧拉）。
-            self.epsp["exx"] = self.epsp["exx"] + dt_s * cp_out["epsp_dot_xx"]
-            self.epsp["eyy"] = self.epsp["eyy"] + dt_s * cp_out["epsp_dot_yy"]
-            self.epsp["exy"] = self.epsp["exy"] + dt_s * cp_out["epsp_dot_xy"]
-            self.state["epspeq"] = self.state["epspeq"] + dt_s * cp_out["epspeq_dot"]
-            self.state["epspeq_dot"] = torch.clamp(
+            epsp_dot_xx_slip = torch.nan_to_num(cp_out["epsp_dot_xx"], nan=0.0, posinf=0.0, neginf=0.0)
+            epsp_dot_yy_slip = torch.nan_to_num(cp_out["epsp_dot_yy"], nan=0.0, posinf=0.0, neginf=0.0)
+            epsp_dot_xy_slip = torch.nan_to_num(cp_out["epsp_dot_xy"], nan=0.0, posinf=0.0, neginf=0.0)
+            self.epsp["exx"] = self.epsp["exx"] + dt_s * epsp_dot_xx_slip
+            self.epsp["eyy"] = self.epsp["eyy"] + dt_s * epsp_dot_yy_slip
+            self.epsp["exy"] = self.epsp["exy"] + dt_s * epsp_dot_xy_slip
+            epspeq_dot_slip = torch.clamp(
                 torch.nan_to_num(cp_out["epspeq_dot"], nan=0.0, posinf=0.0, neginf=0.0),
+                min=0.0,
+                max=1e6,
+            )
+            self.state["epspeq_dot_slip"] = epspeq_dot_slip
+            self.state["epspeq_slip"] = torch.clamp(
+                torch.nan_to_num(self.state.get("epspeq_slip", self.state["epspeq"]), nan=0.0, posinf=1e6, neginf=0.0)
+                + dt_s * epspeq_dot_slip,
                 min=0.0,
                 max=1e6,
             )
             self.epsp["exx"] = torch.clamp(torch.nan_to_num(self.epsp["exx"], nan=0.0, posinf=0.0, neginf=0.0), min=-1.0, max=1.0)
             self.epsp["eyy"] = torch.clamp(torch.nan_to_num(self.epsp["eyy"], nan=0.0, posinf=0.0, neginf=0.0), min=-1.0, max=1.0)
             self.epsp["exy"] = torch.clamp(torch.nan_to_num(self.epsp["exy"], nan=0.0, posinf=0.0, neginf=0.0), min=-1.0, max=1.0)
-            self.state["epspeq"] = torch.clamp(
-                torch.nan_to_num(self.state["epspeq"], nan=0.0, posinf=1e6, neginf=0.0),
-                min=0.0,
-                max=1e6,
-            )
 
             if bool(cp_out.get("plastic_active", True)):
                 # 1.4 若塑性激活，执行力学校正步，减小“先塑性后应力”的不一致。
@@ -1676,8 +1748,8 @@ class CoupledSimulator:
             self._last_mech_phi = self.state["phi"].clone()
             self._last_mech_eta = self.state["eta"].clone()
         else:
-            # 非力学更新步视为准静态保持，塑性应变率设为 0，避免历史量持续驱动腐蚀。
-            self.state["epspeq_dot"] = torch.zeros_like(self.state["phi"])
+            # 非力学更新步：滑移塑性速率置零，孪晶贡献将在后续 eta 更新后统一计入。
+            self.state["epspeq_dot_slip"] = z_like
 
         # 无论力学本步是否更新，都保持 state 与内部塑性张量同步。
         self._sync_epsp_to_state()
@@ -1847,6 +1919,43 @@ class CoupledSimulator:
         eta_new = torch.nan_to_num(eta_new, nan=0.0, posinf=1.0, neginf=0.0)
         eta_new = eta_new * self._solid_weight(phi_new)
 
+        # 2.1 等效塑性应变速率（total）= 滑移贡献 + 权重*孪晶转变贡献。
+        f_eta_old = self._twin_fraction(eta)
+        f_eta_new = self._twin_fraction(eta_new)
+        df_twin = f_eta_new - f_eta_old
+        g_tw = float(self.cfg.twinning.gamma_twin)
+        de_tw_xx = g_tw * df_twin * self.twin_sx * self.twin_nx
+        de_tw_yy = g_tw * df_twin * self.twin_sy * self.twin_ny
+        de_tw_xy = g_tw * 0.5 * df_twin * (self.twin_sx * self.twin_ny + self.twin_sy * self.twin_nx)
+        epsp_dot_xx_twin = de_tw_xx / max(float(dt_s), 1e-12)
+        epsp_dot_yy_twin = de_tw_yy / max(float(dt_s), 1e-12)
+        epsp_dot_xy_twin = de_tw_xy / max(float(dt_s), 1e-12)
+        epspeq_dot_twin = self._equivalent_strain_rate(epsp_dot_xx_twin, epsp_dot_yy_twin, epsp_dot_xy_twin)
+        epspeq_dot_twin = torch.clamp(
+            torch.nan_to_num(epspeq_dot_twin, nan=0.0, posinf=0.0, neginf=0.0),
+            min=0.0,
+            max=1e6,
+        )
+        self.state["epspeq_dot_twin"] = epspeq_dot_twin
+        self.state["epspeq_twin"] = torch.clamp(
+            torch.nan_to_num(self.state.get("epspeq_twin", torch.zeros_like(phi)), nan=0.0, posinf=1e6, neginf=0.0)
+            + dt_s * epspeq_dot_twin,
+            min=0.0,
+            max=1e6,
+        )
+        twin_w = max(float(getattr(self.cfg.corrosion, "epspeq_twin_weight", 1.0)), 0.0)
+        epspeq_dot_total = epspeq_dot_slip + twin_w * epspeq_dot_twin
+        self.state["epspeq_dot"] = torch.clamp(
+            torch.nan_to_num(epspeq_dot_total, nan=0.0, posinf=0.0, neginf=0.0),
+            min=0.0,
+            max=1e6,
+        )
+        self.state["epspeq"] = torch.clamp(
+            torch.nan_to_num(self.state["epspeq"], nan=0.0, posinf=1e6, neginf=0.0) + dt_s * self.state["epspeq_dot"],
+            min=0.0,
+            max=1e6,
+        )
+
         self.state["phi"] = phi_new
         self.state["c"] = c_new
         self.state["eta"] = eta_new
@@ -1917,7 +2026,10 @@ class CoupledSimulator:
                             self.epsp = self._epsp_from_state(self.state)
                             self._sync_epsp_to_state()
                             if not bool(getattr(self.cfg.ml, "surrogate_update_plastic_fields", False)):
-                                self.state["epspeq_dot"] = torch.zeros_like(self.state["phi"])
+                                zphi = torch.zeros_like(self.state["phi"])
+                                self.state["epspeq_dot"] = zphi
+                                self.state["epspeq_dot_slip"] = zphi
+                                self.state["epspeq_dot_twin"] = zphi
                             if self.cfg.ml.enable_surrogate_mechanics_correction:
                                 # 可选：对 surrogate 状态再做一次力学校正。
                                 self.last_mech = gate_mech if gate_mech is not None else self.mech.solve_quasi_static(

@@ -152,6 +152,10 @@ class CorrosionConfig:
     cMg_min: float = 0.0
     cMg_max: float = 1.0
     gamma_J_m2: float = 0.5
+    # interface_thickness_um 的口径定义：
+    # - tanh_half_width: 配置值即 tanh 界面的半宽参数 a（推荐）
+    # - legacy_energy_equiv: 兼容历史版本参数定标
+    interface_thickness_definition: str = "tanh_half_width"
     # <=0 时自动继承 DomainConfig.interface_width_um，实现单一界面厚度来源。
     interface_thickness_um: float = -1.0
     A_J_m3: float = 6.0e7
@@ -173,6 +177,10 @@ class CorrosionConfig:
     use_epspeq_rate_for_mobility: bool = True
     epspeq_dot_ref_s_inv: float = 1.0e-3
     k_epsdot: float = 1.0
+    # 将孪晶转变应变速率并入等效塑性速率的权重（total-epspeq 路径）。
+    epspeq_twin_weight: float = 1.0
+    # 腐蚀应力驱动是否优先使用“未掩膜固相应力”。
+    use_solid_sigma_for_corrosion: bool = True
     include_mech_term_in_phi_variation: bool = False
     include_twin_grad_term_in_phi_variation: bool = False
     # 若启用 include_mech_term_in_phi_variation，则在自由能中加入一致的 -h(phi)*e_mech 近似项，
@@ -441,17 +449,17 @@ def default_slip_systems_hcp_3d() -> List[Dict[str, Any]]:
     ]
     for i, (d, p) in enumerate(prismatic_defs, start=1):
         systems.append({"name": f"prismatic_{i}", "family": "prismatic", "direction_mb": d, "plane_mb": p})
-    # pyramidal <c+a>：保留可运行默认向量，并在加载时执行正交化。
+    # pyramidal <c+a>：默认也采用四指数定义，避免手填笛卡尔向量的口径漂移。
     pyramidal_defs = [
-        ([0.7, 0.0, 0.714], [0.0, 0.917, -0.399]),
-        ([0.35, 0.606, 0.714], [-0.794, 0.458, -0.399]),
-        ([-0.35, 0.606, 0.714], [-0.794, -0.458, -0.399]),
-        ([-0.7, 0.0, 0.714], [0.0, -0.917, -0.399]),
-        ([-0.35, -0.606, 0.714], [0.794, -0.458, -0.399]),
-        ([0.35, -0.606, 0.714], [0.794, 0.458, -0.399]),
+        ([0, -1, 1, 1], [1, 0, -1, 1]),
+        ([-1, 0, 1, 1], [0, 1, -1, 1]),
+        ([1, 0, -1, 1], [-1, 1, 0, 1]),
+        ([0, 1, -1, -1], [-1, 0, 1, 1]),
+        ([1, 0, -1, -1], [0, -1, 1, 1]),
+        ([-1, 0, 1, -1], [1, -1, 0, 1]),
     ]
-    for i, (s, n) in enumerate(pyramidal_defs, start=1):
-        systems.append({"name": f"pyramidal_{i}", "family": "pyramidal", "s_crystal": s, "n_crystal": n})
+    for i, (d, p) in enumerate(pyramidal_defs, start=1):
+        systems.append({"name": f"pyramidal_{i}", "family": "pyramidal", "direction_mb": d, "plane_mb": p})
     return systems
 
 
