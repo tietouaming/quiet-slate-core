@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 
 from .features import DEFAULT_FIELD_CHANNELS, descriptor_vector, extract_micro_descriptors, extract_micro_tensor
 
@@ -54,6 +56,21 @@ class MultiScaleDatasetConfig:
     frame_stride: int = 1
     max_samples_per_case: int = 0
     macro_targets: MacroTargetSpec = field(default_factory=MacroTargetSpec)
+
+
+@dataclass
+class MultiFidelityDatasetConfig(MultiScaleDatasetConfig):
+    """多保真数据集构建配置。
+
+    说明：
+    - `target_hw` 对应高保真输入分辨率；
+    - `low_target_hw` 用于构造低保真目标（从目标快照降采样后提取宏观指标）；
+    - `high_fidelity_keep_ratio` 控制可用高保真标签比例（模拟“高精度宏观标签稀缺”场景）。
+    """
+
+    low_target_hw: Tuple[int, int] = (48, 48)
+    high_fidelity_keep_ratio: float = 1.0
+    seed: int = 42
 
 
 def _parse_step_from_snapshot_name(path: Path) -> int:
@@ -104,6 +121,41 @@ def _macro_target_value(name: str, desc: Dict[str, float], hist: Dict[str, float
 def _load_snapshot_npz(path: Path) -> Dict[str, np.ndarray]:
     z = np.load(path, allow_pickle=False)
     return {k: z[k] for k in z.files}
+
+
+def _resize_snapshot_for_low_fidelity(snapshot: Dict[str, np.ndarray], target_hw: Tuple[int, int]) -> Dict[str, np.ndarray]:
+    """将快照字段降采样到低保真网格，用于构造低保真目标。"""
+    out: Dict[str, np.ndarray] = {}
+    th, tw = int(target_hw[0]), int(target_hw[1])
+    for k, v in snapshot.items():
+        arr = np.asarray(v)
+        if arr.ndim == 4 and arr.shape[0] == 1 and arr.shape[1] == 1:
+            arr2 = arr[0, 0]
+        elif arr.ndim == 3 and arr.shape[0] == 1:
+            arr2 = arr[0]
+        elif arr.ndim == 2:
+            arr2 = arr
+        else:
+            continue
+        t = torch.from_numpy(arr2.astype(np.float32, copy=False))[None, None]
+        r = F.interpolate(t, size=(th, tw), mode="bilinear", align_corners=False)[0, 0].cpu().numpy().astype(np.float32)
+        out[str(k)] = r
+    return out
+
+
+def _sample_high_label_mask(n: int, ratio: float, seed: int) -> np.ndarray:
+    """生成高保真标签可用掩码。"""
+    r = float(np.clip(ratio, 0.0, 1.0))
+    if r >= 1.0:
+        return np.ones((n,), dtype=np.float32)
+    if r <= 0.0:
+        return np.zeros((n,), dtype=np.float32)
+    rs = np.random.RandomState(int(seed))
+    m = (rs.rand(n) < r).astype(np.float32)
+    # 防止全部为 0，至少保留一个高保真样本用于监督锚定。
+    if np.sum(m) < 1:
+        m[int(rs.randint(0, n))] = 1.0
+    return m
 
 
 def build_multiscale_dataset_from_cases(
@@ -180,6 +232,67 @@ def build_multiscale_dataset_from_cases(
     }
 
 
+def build_multifidelity_dataset_from_cases(
+    case_dirs: Sequence[Path],
+    cfg: MultiFidelityDatasetConfig,
+) -> Dict[str, np.ndarray]:
+    """构建多保真数据集。
+
+    输出字段：
+    - `x_field`, `x_desc`：与单保真一致；
+    - `y`：高保真目标；
+    - `y_low`：低保真目标（降采样快照提取）；
+    - `high_mask`：高保真标签可用掩码（1=有高保真标签，0=仅低保真）。
+    """
+    base = build_multiscale_dataset_from_cases(case_dirs, cfg)
+    ys_low: List[np.ndarray] = []
+    case_ids = [str(v) for v in base["case_ids"].tolist()]
+    t_input = base["t_input"].astype(np.float32)
+    # 为避免重复读取所有输入快照，这里重新遍历样本构建低保真目标。
+    # 由于该阶段离线执行，开销可接受，且逻辑清晰可复现。
+    for case_dir in case_dirs:
+        snap_dir = case_dir / "snapshots"
+        if not snap_dir.exists():
+            continue
+        snaps = sorted(snap_dir.glob("snapshot_*.npz"))
+        if len(snaps) <= cfg.horizon_steps:
+            continue
+        step_to_hist = _load_history_by_step(case_dir)
+        n_keep = 0
+        for i in range(0, len(snaps) - cfg.horizon_steps, max(cfg.frame_stride, 1)):
+            j = i + cfg.horizon_steps
+            p_out = snaps[j]
+            step_out = _parse_step_from_snapshot_name(p_out)
+            if step_out < 0:
+                continue
+            s_out = _load_snapshot_npz(p_out)
+            s_out_low = _resize_snapshot_for_low_fidelity(s_out, cfg.low_target_hw)
+            d_out_low = extract_micro_descriptors(s_out_low)
+            h_out = step_to_hist.get(step_out, {})
+            y_low = np.asarray(
+                [_macro_target_value(k, d_out_low, h_out) for k in cfg.macro_targets.names],
+                dtype=np.float32,
+            )
+            ys_low.append(y_low)
+            n_keep += 1
+            if cfg.max_samples_per_case > 0 and n_keep >= int(cfg.max_samples_per_case):
+                break
+    if len(ys_low) != int(base["y"].shape[0]):
+        raise RuntimeError(
+            f"low fidelity sample count mismatch: low={len(ys_low)}, high={int(base['y'].shape[0])}."
+        )
+    y_low_np = np.stack(ys_low, axis=0).astype(np.float32)
+    high_mask = _sample_high_label_mask(int(base["y"].shape[0]), cfg.high_fidelity_keep_ratio, cfg.seed)
+    return {
+        **base,
+        "y_low": y_low_np,
+        "high_mask": high_mask.astype(np.float32),
+        "low_target_hw": np.asarray(list(cfg.low_target_hw), dtype=np.int32),
+        "high_fidelity_keep_ratio": np.asarray([float(cfg.high_fidelity_keep_ratio)], dtype=np.float32),
+        "seed": np.asarray([int(cfg.seed)], dtype=np.int32),
+    }
+
+
 def save_multiscale_dataset_npz(path: Path | str, payload: Dict[str, np.ndarray]) -> Path:
     """保存跨尺度数据集为 npz。"""
     p = Path(path)
@@ -213,4 +326,3 @@ def discover_case_dirs(
             continue
         out.append(c)
     return out
-

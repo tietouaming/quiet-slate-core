@@ -8,11 +8,22 @@
 
 from .dataset import (
     MacroTargetSpec,
+    MultiFidelityDatasetConfig,
     MultiScaleDatasetConfig,
+    build_multifidelity_dataset_from_cases,
     build_multiscale_dataset_from_cases,
     load_multiscale_dataset_npz,
     save_multiscale_dataset_npz,
 )
+from .advanced_models import (
+    AdvancedModelConfig,
+    HybridUAFNOMacroPredictor,
+    MultiFidelityHybridPredictor,
+    build_advanced_model,
+    load_advanced_model,
+    save_advanced_model,
+)
+from .advanced_train import AdvancedTrainingConfig, train_advanced_multiscale_model
 from .features import extract_micro_descriptors, extract_micro_tensor
 from .inverse_design import (
     DesignVariableSpec,
@@ -21,14 +32,31 @@ from .inverse_design import (
     run_inverse_design,
 )
 from .models import MacroCorrosionPredictor, MultiScaleModelConfig, load_multiscale_model, save_multiscale_model
+from .physics_metrics import PhysicsMetricConfig, evaluate_physics_metrics
 from .train import TrainingConfig, train_multiscale_model
+from .visualization import plot_parity_by_target, plot_training_history, plot_uncertainty_calibration
 
 __all__ = [
     "MacroTargetSpec",
+    "MultiFidelityDatasetConfig",
     "MultiScaleDatasetConfig",
+    "build_multifidelity_dataset_from_cases",
     "build_multiscale_dataset_from_cases",
     "load_multiscale_dataset_npz",
     "save_multiscale_dataset_npz",
+    "AdvancedModelConfig",
+    "HybridUAFNOMacroPredictor",
+    "MultiFidelityHybridPredictor",
+    "build_advanced_model",
+    "save_advanced_model",
+    "load_advanced_model",
+    "AdvancedTrainingConfig",
+    "train_advanced_multiscale_model",
+    "PhysicsMetricConfig",
+    "evaluate_physics_metrics",
+    "plot_training_history",
+    "plot_parity_by_target",
+    "plot_uncertainty_calibration",
     "extract_micro_descriptors",
     "extract_micro_tensor",
     "DesignVariableSpec",
@@ -42,4 +70,3 @@ __all__ = [
     "TrainingConfig",
     "train_multiscale_model",
 ]
-

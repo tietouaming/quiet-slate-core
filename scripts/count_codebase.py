@@ -1,4 +1,4 @@
-"""统计仓库代码规模（按 git 跟踪文件）。"""
+"""统计仓库代码规模（支持跟踪文件与工作区文件）。"""
 
 from __future__ import annotations
 
@@ -6,12 +6,27 @@ import argparse
 import json
 import subprocess
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Set
 
 
 def git_ls_files() -> List[str]:
     out = subprocess.check_output(["git", "ls-files"], text=True, encoding="utf-8")
     return [s.strip() for s in out.splitlines() if s.strip()]
+
+
+def git_ls_untracked_files() -> List[str]:
+    out = subprocess.check_output(["git", "ls-files", "--others", "--exclude-standard"], text=True, encoding="utf-8")
+    return [s.strip() for s in out.splitlines() if s.strip()]
+
+
+def list_files(include_untracked: bool = False) -> List[str]:
+    tracked = git_ls_files()
+    if not include_untracked:
+        return tracked
+    all_files: Set[str] = set(tracked)
+    for f in git_ls_untracked_files():
+        all_files.add(f)
+    return sorted(all_files)
 
 
 def count_lines(path: Path) -> int:
@@ -34,9 +49,10 @@ def sum_lines(files: Iterable[str]) -> int:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Count codebase lines by tracked files.")
     ap.add_argument("--output", type=str, default="", help="optional output json path")
+    ap.add_argument("--include-untracked", action="store_true", help="include untracked working-tree files")
     args = ap.parse_args()
 
-    files = git_ls_files()
+    files = list_files(include_untracked=bool(args.include_untracked))
     py = [f for f in files if f.endswith(".py")]
     md = [f for f in files if f.endswith(".md")]
     yaml = [f for f in files if f.endswith(".yaml") or f.endswith(".yml")]
@@ -48,7 +64,8 @@ def main() -> None:
     multiscale_py = [f for f in py if f.startswith("mg_coupled_pf/multiscale/")]
 
     result: Dict[str, int] = {
-        "total_tracked_files": len(files),
+        "count_mode": "tracked+untracked" if bool(args.include_untracked) else "tracked",
+        "total_files": len(files),
         "py_files": len(py),
         "py_lines_total": sum_lines(py),
         "py_lines_core": sum_lines(core_py),
@@ -74,4 +91,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
