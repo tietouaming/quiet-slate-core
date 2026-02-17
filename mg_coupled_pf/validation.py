@@ -292,6 +292,24 @@ def _audit_twinning_and_cp(cfg: SimulationConfig, rep: ConfigAuditReport) -> Non
             path="twinning.gamma_twin",
             value=tw.gamma_twin,
         )
+    n_var = int(getattr(tw, "n_variants", 1))
+    if n_var < 1:
+        rep.add_error(
+            "TW_VARIANT_COUNT_INVALID",
+            "孪晶变体数量必须 >= 1。",
+            recommendation="设置 twinning.n_variants >= 1。",
+            path="twinning.n_variants",
+            value=n_var,
+        )
+    idx_cfg = [int(v) for v in list(getattr(tw, "twin_variant_indices", []))]
+    if idx_cfg and len(idx_cfg) < max(n_var, 1):
+        rep.add_warning(
+            "TW_VARIANT_INDEX_LIST_SHORT",
+            "显式孪晶变体索引数量少于 n_variants，剩余变体将回退到默认顺序。",
+            recommendation="补全 twinning.twin_variant_indices 或降低 twinning.n_variants。",
+            path="twinning.twin_variant_indices",
+            value={"n_variants": n_var, "len(indices)": len(idx_cfg)},
+        )
     if float(cp.gamma0_s_inv) < 0.0:
         rep.add_error(
             "CP_GAMMA0_NEGATIVE",
@@ -336,6 +354,25 @@ def _audit_twinning_and_cp(cfg: SimulationConfig, rep: ConfigAuditReport) -> Non
             path="twin_systems",
             value=0,
         )
+    else:
+        n_avail = len(cfg.twin_systems)
+        if n_var > n_avail:
+            rep.add_warning(
+                "TW_VARIANT_COUNT_EXCEEDS_LIBRARY",
+                "请求的孪晶变体数量超过可用系统数，多余部分将被截断/复用。",
+                recommendation="减小 twinning.n_variants 或提供更多 twin_systems。",
+                path="twinning.n_variants",
+                value={"n_variants": n_var, "n_available": n_avail},
+            )
+        for j, idx in enumerate(idx_cfg):
+            if idx < 0 or idx >= n_avail:
+                rep.add_error(
+                    "TW_VARIANT_INDEX_OUT_OF_RANGE",
+                    "孪晶变体索引越界。",
+                    recommendation="确保每个 twinning.twin_variant_indices 都在 [0, len(twin_systems)-1]。",
+                    path=f"twinning.twin_variant_indices[{j}]",
+                    value={"index": idx, "n_available": n_avail},
+                )
 
     for i, s in enumerate(cfg.slip_systems):
         sv = [float(v) for v in s.get("s_crystal", [])]
@@ -477,4 +514,3 @@ def summarize_audit_report(report: ConfigAuditReport) -> str:
         f"[{st}] errors={report.error_count} "
         f"warnings={report.warning_count} infos={report.info_count}"
     )
-

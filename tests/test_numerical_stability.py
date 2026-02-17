@@ -897,3 +897,46 @@ def test_mechanics_anisotropic_plane_stress_enforces_sigma_zz_zero() -> None:
     exy = torch.full_like(phi, 0.0015)
     sig = mech.constitutive_stress(phi, ex, ey, exy, eta=eta)
     assert float(torch.max(torch.abs(sig["sigma_zz_solid"])).item()) < 1e-8
+
+
+def test_multivariant_eta_state_consistency_and_sum_constraint() -> None:
+    """多孪晶变体开启后，应保持 eta=Σeta_v 且可选约束 Σeta_v<=1。"""
+    cfg = load_config("configs/notch_case.yaml")
+    cfg.runtime.device = "cpu"
+    cfg.domain.nx = 40
+    cfg.domain.ny = 28
+    cfg.numerics.n_steps = 2
+    cfg.numerics.dt_s = 2e-4
+    cfg.ml.enabled = False
+    cfg.twinning.n_variants = 2
+    cfg.twinning.twin_variant_indices = [0, 1]
+    cfg.twinning.enforce_variant_sum_le_one = True
+    # 提高孪晶激活概率，便于触发两变体更新。
+    cfg.twinning.twin_crss_MPa = -1e6
+    cfg.twinning.nucleation_source_amp = 1e-3
+    sim = CoupledSimulator(cfg)
+    for i in range(1, cfg.numerics.n_steps + 1):
+        sim.step(i)
+    assert "eta_v1" in sim.state and "eta_v2" in sim.state
+    eta_sum = sim.state["eta_v1"] + sim.state["eta_v2"]
+    err = float(torch.max(torch.abs(sim.state["eta"] - eta_sum)).item())
+    assert err < 1e-6
+    assert float(torch.max(eta_sum).item()) <= 1.0001
+
+
+def test_multivariant_short_run_remains_finite() -> None:
+    """多孪晶变体短程运行应保持有限值并完成力学-孪晶耦合。"""
+    cfg = load_config("configs/notch_case.yaml")
+    cfg.runtime.device = "cpu"
+    cfg.domain.nx = 48
+    cfg.domain.ny = 32
+    cfg.numerics.n_steps = 3
+    cfg.numerics.dt_s = 1e-4
+    cfg.ml.enabled = False
+    cfg.twinning.n_variants = 2
+    cfg.twinning.twin_variant_indices = [0, 1]
+    sim = CoupledSimulator(cfg)
+    for i in range(1, cfg.numerics.n_steps + 1):
+        sim.step(i)
+    for k in ("phi", "c", "eta", "eta_v1", "eta_v2", "epspeq"):
+        assert torch.isfinite(sim.state[k]).all()

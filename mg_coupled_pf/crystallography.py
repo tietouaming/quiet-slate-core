@@ -194,12 +194,16 @@ def resolve_twin_pair_xy(
     twin_systems: List[Dict[str, Any]],
     *,
     orientation_euler_deg: List[float],
+    variant_index: int | None = None,
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tuple[float, float, float, float]:
     """解析并旋转孪晶系，返回样品坐标下二维 `(sx, sy, nx, ny)`。"""
     c_over_a = float(getattr(twinning_cfg, "twin_hcp_c_over_a", 1.624))
-    idx = int(getattr(twinning_cfg, "twin_variant_index", 0))
+    if variant_index is None:
+        idx = int(getattr(twinning_cfg, "twin_variant_index", 0))
+    else:
+        idx = int(variant_index)
     if twin_systems:
         idx = max(0, min(idx, len(twin_systems) - 1))
         tw = twin_systems[idx]
@@ -222,4 +226,3 @@ def resolve_twin_pair_xy(
     s_s, n_s = orthonormalize_pair(s_s, n_s)
     sx, sy, nx, ny = project_pair_to_xy(s_s, n_s, device=device, dtype=dtype)
     return float(sx.item()), float(sy.item()), float(nx.item()), float(ny.item())
-

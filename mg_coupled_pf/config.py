@@ -208,8 +208,16 @@ class TwinningConfig:
     twin_hcp_c_over_a: float = 1.624
     # 孪晶系统文件（晶体坐标），支持 s_crystal/n_crystal 或 direction_mb/plane_mb。
     twin_systems_file: str = "configs/twin_systems_hcp_3d.json"
-    # 单序参量模型当前仅使用一个变体，可通过索引选择。
+    # 单变体兼容参数：当 n_variants=1 时使用该索引。
     twin_variant_index: int = 0
+    # 多变体扩展：启用变体个数（>=1）。
+    n_variants: int = 1
+    # 可选：显式指定变体索引列表；为空时默认选取前 n_variants 个。
+    twin_variant_indices: List[int] = field(default_factory=list)
+    # 变体竞争耦合系数（MPa）：>0 时抑制多变体在同一点同时增大。
+    variant_competition_MPa: float = 0.0
+    # 是否强制约束各变体序参量和 <= 1。
+    enforce_variant_sum_le_one: bool = True
     # 旧版实验室角度定义（仅兼容回退，不建议作为默认物理路径）。
     twin_shear_dir_angle_deg: float = 35.0
     twin_plane_normal_angle_deg: float = 125.0

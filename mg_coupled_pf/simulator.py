@@ -110,10 +110,27 @@ class CoupledSimulator:
         self.cp_state = self.cp.init_state(cfg.domain.ny, cfg.domain.nx)
         self.mech = MechanicsModel(cfg)
         # 与力学/CP一致：孪晶系由晶体学定义+取向旋转得到，不再使用固定实验室角度。
-        self.twin_sx = torch.tensor(float(self.mech.sx), device=self.device, dtype=self.dtype)
-        self.twin_sy = torch.tensor(float(self.mech.sy), device=self.device, dtype=self.dtype)
-        self.twin_nx = torch.tensor(float(self.mech.nx), device=self.device, dtype=self.dtype)
-        self.twin_ny = torch.tensor(float(self.mech.ny), device=self.device, dtype=self.dtype)
+        self.twin_variant_pairs: List[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        for sx, sy, nx, ny in list(getattr(self.mech, "twin_variant_pairs", [])):
+            self.twin_variant_pairs.append(
+                (
+                    torch.tensor(float(sx), device=self.device, dtype=self.dtype),
+                    torch.tensor(float(sy), device=self.device, dtype=self.dtype),
+                    torch.tensor(float(nx), device=self.device, dtype=self.dtype),
+                    torch.tensor(float(ny), device=self.device, dtype=self.dtype),
+                )
+            )
+        if not self.twin_variant_pairs:
+            self.twin_variant_pairs = [
+                (
+                    torch.tensor(float(self.mech.sx), device=self.device, dtype=self.dtype),
+                    torch.tensor(float(self.mech.sy), device=self.device, dtype=self.dtype),
+                    torch.tensor(float(self.mech.nx), device=self.device, dtype=self.dtype),
+                    torch.tensor(float(self.mech.ny), device=self.device, dtype=self.dtype),
+                )
+            ]
+        # 兼容旧单变体路径：保留首个变体方向字段。
+        self.twin_sx, self.twin_sy, self.twin_nx, self.twin_ny = self.twin_variant_pairs[0]
         self.pitting_field = pitting_mobility_field(cfg, self.grid)
         self.surrogate_field_scales = build_surrogate_field_scales(cfg)
         self.mech_input_scales, self.mech_output_scales = build_mechanics_field_scales(cfg)
@@ -253,6 +270,9 @@ class CoupledSimulator:
         # 力学自适应触发参考态：记录上次力学求解对应的微结构。
         self._last_mech_phi = self.state["phi"].clone()
         self._last_mech_eta = self.state["eta"].clone()
+        # 多孪晶变体状态（兼容：n_variants=1 时仅维护 eta_v1）。
+        self.eta_variants = self._collect_eta_variants_from_state(self.state)
+        self._sync_eta_variants_to_state(self.state, self.eta_variants)
 
     def _build_area_weights(self, x_coords_um: torch.Tensor, y_coords_um: torch.Tensor) -> torch.Tensor:
         """构造面积加权矩阵，用于非均匀网格上的加权平均。"""
@@ -286,6 +306,101 @@ class CoupledSimulator:
     def _solid_weight(phi: torch.Tensor) -> torch.Tensor:
         """固相连续权重：w_solid = h(phi)。"""
         return smooth_heaviside(torch.clamp(phi, 0.0, 1.0))
+
+    def _num_twin_variants(self) -> int:
+        """返回当前启用的孪晶变体数。"""
+        return max(1, len(self.twin_variant_pairs))
+
+    @staticmethod
+    def _eta_variant_key(idx: int) -> str:
+        """变体序参量在 state 中的键名。"""
+        return f"eta_v{idx + 1}"
+
+    def _aggregate_eta_variants(self, variants: List[torch.Tensor]) -> torch.Tensor:
+        """将多变体序参量求和为总 eta。"""
+        if not variants:
+            return torch.zeros_like(self.state["phi"])
+        out = torch.zeros_like(variants[0])
+        for v in variants:
+            out = out + torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+        return torch.clamp(out, 0.0, 1.0)
+
+    def _enforce_eta_variant_constraints(
+        self,
+        variants: List[torch.Tensor],
+        *,
+        solid: torch.Tensor | None = None,
+    ) -> List[torch.Tensor]:
+        """对多变体 eta 做有界与和约束（可选再乘固相权重）。"""
+        if not variants:
+            return []
+        out = [
+            torch.clamp(torch.nan_to_num(v, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+            for v in variants
+        ]
+        if bool(getattr(self.cfg.twinning, "enforce_variant_sum_le_one", True)):
+            s = torch.zeros_like(out[0])
+            for v in out:
+                s = s + v
+            inv = torch.where(s > 1.0, 1.0 / torch.clamp(s, min=1e-12), torch.ones_like(s))
+            out = [v * inv for v in out]
+        if solid is not None:
+            out = [v * solid for v in out]
+        return out
+
+    def _distribute_total_eta_to_variants(
+        self,
+        eta_total: torch.Tensor,
+        base_variants: List[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        """按旧变体比例将总 eta 分配回各变体。"""
+        n_var = self._num_twin_variants()
+        if n_var <= 1:
+            return [torch.clamp(eta_total, 0.0, 1.0)]
+        eta_t = torch.clamp(torch.nan_to_num(eta_total, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+        if not base_variants or len(base_variants) < n_var:
+            out = [torch.zeros_like(eta_t) for _ in range(n_var)]
+            out[0] = eta_t
+            return out
+        base = [torch.clamp(torch.nan_to_num(v, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0) for v in base_variants[:n_var]]
+        s = torch.zeros_like(eta_t)
+        for v in base:
+            s = s + v
+        out: List[torch.Tensor] = []
+        for i in range(n_var):
+            frac = torch.where(s > 1e-12, base[i] / torch.clamp(s, min=1e-12), torch.zeros_like(s))
+            out.append(eta_t * frac)
+        # 若局部 base 全零，则默认把该处总 eta 放到第一个变体。
+        zero_mask = (s <= 1e-12).to(dtype=eta_t.dtype)
+        out[0] = out[0] + eta_t * zero_mask
+        return out
+
+    def _sync_eta_variants_to_state(self, state: Dict[str, torch.Tensor], variants: List[torch.Tensor]) -> None:
+        """将多变体 eta 写回 state，并同步总 eta。"""
+        n_var = self._num_twin_variants()
+        v_use = variants[:n_var] if variants else [state["eta"]]
+        if len(v_use) < n_var:
+            fill = [torch.zeros_like(v_use[0]) for _ in range(n_var - len(v_use))]
+            v_use = v_use + fill
+        for i in range(n_var):
+            state[self._eta_variant_key(i)] = v_use[i]
+        state["eta"] = self._aggregate_eta_variants(v_use)
+
+    def _collect_eta_variants_from_state(self, state: Dict[str, torch.Tensor]) -> List[torch.Tensor]:
+        """从任意 state 提取多变体 eta；若缺失则按当前比例回填。"""
+        n_var = self._num_twin_variants()
+        if n_var <= 1:
+            eta = torch.clamp(torch.nan_to_num(state["eta"], nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+            return [eta]
+        keys = [self._eta_variant_key(i) for i in range(n_var)]
+        if all(k in state for k in keys):
+            variants = [state[k] for k in keys]
+        else:
+            eta_total = torch.clamp(torch.nan_to_num(state["eta"], nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+            base = list(getattr(self, "eta_variants", []))
+            variants = self._distribute_total_eta_to_variants(eta_total, base)
+        solid = self._solid_weight(state.get("phi", self.state["phi"]))
+        return self._enforce_eta_variant_constraints(variants, solid=solid)
 
     def _project_concentration_mean(
         self,
@@ -346,10 +461,12 @@ class CoupledSimulator:
     def _estimate_state_mechanics(self, state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """根据给定位移场快速估计应变/应力（不做平衡迭代）。"""
         epsp_state = self._epsp_from_state(state)
+        eta_variants = self._collect_eta_variants_from_state(state)
         eps = self.mech._strain_from_displacement(
             state["ux"],
             state["uy"],
             state["eta"],
+            eta_variants,
             epsp_state,
             self.dx_um,
             self.dy_um,
@@ -1309,12 +1426,22 @@ class CoupledSimulator:
             base = float(torch.max(L_phi_pos).item())
         return max(base * safety, 0.0)
 
-    def _resolved_twin_shear(self, sigma_xx: torch.Tensor, sigma_yy: torch.Tensor, sigma_xy: torch.Tensor) -> torch.Tensor:
-        """计算孪晶系分解剪应力。"""
-        tau = self.twin_sx * (sigma_xx * self.twin_nx + sigma_xy * self.twin_ny) + self.twin_sy * (
-            sigma_xy * self.twin_nx + sigma_yy * self.twin_ny
-        )
+    def _resolved_twin_shear_variant(
+        self,
+        variant_idx: int,
+        sigma_xx: torch.Tensor,
+        sigma_yy: torch.Tensor,
+        sigma_xy: torch.Tensor,
+    ) -> torch.Tensor:
+        """计算指定孪晶变体的分解剪应力。"""
+        i = max(0, min(int(variant_idx), self._num_twin_variants() - 1))
+        sx, sy, nx, ny = self.twin_variant_pairs[i]
+        tau = sx * (sigma_xx * nx + sigma_xy * ny) + sy * (sigma_xy * nx + sigma_yy * ny)
         return tau
+
+    def _resolved_twin_shear(self, sigma_xx: torch.Tensor, sigma_yy: torch.Tensor, sigma_xy: torch.Tensor) -> torch.Tensor:
+        """兼容单变体接口：返回首个变体分解剪应力。"""
+        return self._resolved_twin_shear_variant(0, sigma_xx, sigma_yy, sigma_xy)
 
     def _twin_nucleation_activation(self, tau_tw: torch.Tensor) -> torch.Tensor:
         """孪晶形核激活：仅对有利剪切方向（tau_tw > twin_crss）开启。"""
@@ -1342,12 +1469,22 @@ class CoupledSimulator:
             cmin,
             cmax,
         )
-        self.state["eta"] = self._soft_project_range(
-            torch.nan_to_num(self.state["eta"], nan=0.0, posinf=1.0, neginf=0.0),
-            0.0,
-            1.0,
-        )
-        self.state["eta"] = self.state["eta"] * solid
+        n_var = self._num_twin_variants()
+        eta_vars_raw = self._collect_eta_variants_from_state(self.state)
+        eta_vars = [
+            self._soft_project_range(
+                torch.nan_to_num(v, nan=0.0, posinf=1.0, neginf=0.0),
+                0.0,
+                1.0,
+            )
+            for v in eta_vars_raw
+        ]
+        eta_vars = self._enforce_eta_variant_constraints(eta_vars, solid=solid)
+        self.eta_variants = eta_vars
+        self._sync_eta_variants_to_state(self.state, eta_vars)
+        if n_var <= 1:
+            # 兼容旧路径：确保 eta_v1 始终存在。
+            self.state[self._eta_variant_key(0)] = self.state["eta"]
         self.state["epspeq"] = torch.clamp(
             torch.nan_to_num(self.state["epspeq"], nan=0.0, posinf=1e6, neginf=0.0),
             0.0,
@@ -1625,6 +1762,16 @@ class CoupledSimulator:
             out["epsp_yy"] = torch.clamp(out["epsp_yy"], -1.0, 1.0)
         if "epsp_xy" in out:
             out["epsp_xy"] = torch.clamp(out["epsp_xy"], -1.0, 1.0)
+        # surrogate 目前仅直接输出总 eta；多变体场按上一状态比例回填并约束和 <= 1。
+        n_var = self._num_twin_variants()
+        if n_var > 1:
+            base_vars = self._collect_eta_variants_from_state(prev)
+            eta_vars = self._distribute_total_eta_to_variants(out["eta"], base_vars)
+            solid = self._solid_weight(out["phi"])
+            eta_vars = self._enforce_eta_variant_constraints(eta_vars, solid=solid)
+            self._sync_eta_variants_to_state(out, eta_vars)
+        else:
+            out[self._eta_variant_key(0)] = out["eta"]
         return out
 
     def _physics_step(self, dt_s: float, step_idx: int) -> None:
@@ -1668,9 +1815,11 @@ class CoupledSimulator:
                     self.stats["mech_ml_initial_guess_used"] += 1
                     self.stats["mech_ml_initial_guess_surrogate"] += 1
             # 1.1 预测力学平衡：基于当前位移/本征应变求解应力。
+            eta_variants_mech = self._collect_eta_variants_from_state(self.state)
             mech_predict = self.mech.solve_quasi_static(
                 self.state,
                 self.epsp,
+                eta_variants_mech,
                 self.dx_um,
                 self.dy_um,
                 x_coords_um=self.x_coords_um,
@@ -1726,6 +1875,7 @@ class CoupledSimulator:
                 self.last_mech = self.mech.solve_quasi_static(
                     self.state,
                     self.epsp,
+                    eta_variants_mech,
                     self.dx_um,
                     self.dy_um,
                     x_coords_um=self.x_coords_um,
@@ -1757,7 +1907,9 @@ class CoupledSimulator:
         # 2) 腐蚀 + 扩散 + 孪晶演化
         phi = self.state["phi"]
         cbar = self.state["c"]
-        eta = self.state["eta"]
+        eta_variants_prev = self._collect_eta_variants_from_state(self.state)
+        eta = self._aggregate_eta_variants(eta_variants_prev)
+        self.state["eta"] = eta
         bc = self._scalar_bc()
         hphi = smooth_heaviside(phi)
         hphi_d = smooth_heaviside_prime(phi)
@@ -1868,65 +2020,93 @@ class CoupledSimulator:
             )
             self.stats["mass_projection_applied"] += 1
 
-        # 孪晶 TDGL 方程推进。
-        heta_d = smooth_heaviside_prime(eta)
-        # TDGL 与固液界面耦合应使用最新 phi，避免“先错算再投影”。
+        # 孪晶 TDGL 方程推进（支持多变体）。
         hphi_eta = smooth_heaviside(phi_new)
         k_eta = self.cfg.twinning.kappa_eta
         grad_coef_eta = k_eta * hphi_eta
         w_t = self.cfg.twinning.W_barrier_MPa
-        twin_dw = hphi_eta * 2.0 * w_t * eta * (1.0 - eta) * (1.0 - 2.0 * eta)
-        tau_tw = self._resolved_twin_shear(self.last_mech["sigma_xx"], self.last_mech["sigma_yy"], self.last_mech["sigma_xy"])
-        # 正向驱动：分解剪应力 * 孪晶剪切量 * 势函数导数。
-        tw_drive = hphi_eta * tau_tw * self.cfg.twinning.gamma_twin * heta_d
-
-        # 在缺口附近且分解剪应力超过阈值时引入成核扰动。
+        eta_mode = str(self.cfg.numerics.eta_integrator).strip().lower()
+        n_var = self._num_twin_variants()
+        variant_comp = max(float(getattr(self.cfg.twinning, "variant_competition_MPa", 0.0)), 0.0)
+        f_twin_prev = [self._twin_fraction(v) for v in eta_variants_prev]
+        f_twin_sum_prev = torch.zeros_like(phi)
+        for fv in f_twin_prev:
+            f_twin_sum_prev = f_twin_sum_prev + fv
+        # 在缺口附近且分解剪应力超过阈值时引入成核项（每个变体独立判定）。
         r2 = (self.grid.x_um - self.cfg.domain.notch_tip_x_um) ** 2 + (self.grid.y_um - self.cfg.domain.notch_center_y_um) ** 2
         nuc = torch.exp(-r2 / max(self.cfg.twinning.nucleation_center_radius_um ** 2, 1e-12))
-        act = self._twin_nucleation_activation(tau_tw)
-        nuc_source = hphi_eta * self._twin_nucleation_source_amp() * nuc * act
 
-        eta_source = twin_dw - tw_drive - nuc_source
-        eta_source = torch.nan_to_num(eta_source, nan=0.0, posinf=0.0, neginf=0.0)
-        eta_mode = str(self.cfg.numerics.eta_integrator).strip().lower()
-        if eta_mode.startswith("imex"):
-            # IMEX: 梯度正则项隐式，驱动项显式。
-            rhs_eta = eta - dt_s * self.cfg.twinning.L_eta * eta_source
-            eta_new = self._solve_variable_diffusion_imex(
-                rhs_eta,
-                coeff=dt_s * self.cfg.twinning.L_eta,
-                diff_coef=grad_coef_eta,
-                dx=self.dx_um,
-                dy=self.dy_um,
-                x_coords=self.x_coords_um,
-                y_coords=self.y_coords_um,
-                x0=eta,
+        eta_variants_new: List[torch.Tensor] = []
+        for k in range(n_var):
+            eta_k = eta_variants_prev[k]
+            heta_d_k = smooth_heaviside_prime(eta_k)
+            twin_dw_k = hphi_eta * 2.0 * w_t * eta_k * (1.0 - eta_k) * (1.0 - 2.0 * eta_k)
+            tau_tw_k = self._resolved_twin_shear_variant(
+                k,
+                self.last_mech["sigma_xx"],
+                self.last_mech["sigma_yy"],
+                self.last_mech["sigma_xy"],
             )
-        else:
-            grad_term = self._div_diffusive_fv(
-                eta,
-                torch.clamp(grad_coef_eta, min=0.0),
-                dx=self.dx_um,
-                dy=self.dy_um,
-                x_coords=self.x_coords_um,
-                y_coords=self.y_coords_um,
-                bc=bc,
-            )
-            eta_rhs = eta_source - grad_term
-            eta_rhs = torch.nan_to_num(eta_rhs, nan=0.0, posinf=0.0, neginf=0.0)
-            eta_new = eta - dt_s * self.cfg.twinning.L_eta * eta_rhs
-        eta_new = torch.clamp(eta_new, 0.0, 1.0)
-        eta_new = torch.nan_to_num(eta_new, nan=0.0, posinf=1.0, neginf=0.0)
-        eta_new = eta_new * self._solid_weight(phi_new)
+            # 正向驱动：分解剪应力 * 孪晶剪切量 * 势函数导数。
+            tw_drive_k = hphi_eta * tau_tw_k * self.cfg.twinning.gamma_twin * heta_d_k
+            act_k = self._twin_nucleation_activation(tau_tw_k)
+            nuc_source_k = hphi_eta * self._twin_nucleation_source_amp() * nuc * act_k
+            eta_source_k = twin_dw_k - tw_drive_k - nuc_source_k
+            if n_var > 1 and variant_comp > 0.0:
+                # 变体竞争：抑制同一点多变体同时增长。
+                other_frac = torch.clamp(f_twin_sum_prev - f_twin_prev[k], min=0.0)
+                eta_source_k = eta_source_k + hphi_eta * variant_comp * other_frac * heta_d_k
+            eta_source_k = torch.nan_to_num(eta_source_k, nan=0.0, posinf=0.0, neginf=0.0)
+
+            if eta_mode.startswith("imex"):
+                # IMEX: 梯度正则项隐式，驱动项显式。
+                rhs_eta = eta_k - dt_s * self.cfg.twinning.L_eta * eta_source_k
+                eta_k_new = self._solve_variable_diffusion_imex(
+                    rhs_eta,
+                    coeff=dt_s * self.cfg.twinning.L_eta,
+                    diff_coef=grad_coef_eta,
+                    dx=self.dx_um,
+                    dy=self.dy_um,
+                    x_coords=self.x_coords_um,
+                    y_coords=self.y_coords_um,
+                    x0=eta_k,
+                )
+            else:
+                grad_term_k = self._div_diffusive_fv(
+                    eta_k,
+                    torch.clamp(grad_coef_eta, min=0.0),
+                    dx=self.dx_um,
+                    dy=self.dy_um,
+                    x_coords=self.x_coords_um,
+                    y_coords=self.y_coords_um,
+                    bc=bc,
+                )
+                eta_rhs_k = eta_source_k - grad_term_k
+                eta_rhs_k = torch.nan_to_num(eta_rhs_k, nan=0.0, posinf=0.0, neginf=0.0)
+                eta_k_new = eta_k - dt_s * self.cfg.twinning.L_eta * eta_rhs_k
+            eta_k_new = torch.clamp(eta_k_new, 0.0, 1.0)
+            eta_k_new = torch.nan_to_num(eta_k_new, nan=0.0, posinf=1.0, neginf=0.0)
+            eta_variants_new.append(eta_k_new)
+
+        eta_variants_new = self._enforce_eta_variant_constraints(
+            eta_variants_new,
+            solid=self._solid_weight(phi_new),
+        )
+        eta_new = self._aggregate_eta_variants(eta_variants_new)
 
         # 2.1 等效塑性应变速率（total）= 滑移贡献 + 权重*孪晶转变贡献。
-        f_eta_old = self._twin_fraction(eta)
-        f_eta_new = self._twin_fraction(eta_new)
-        df_twin = f_eta_new - f_eta_old
+        f_eta_old_list = [self._twin_fraction(v) for v in eta_variants_prev]
+        f_eta_new_list = [self._twin_fraction(v) for v in eta_variants_new]
         g_tw = float(self.cfg.twinning.gamma_twin)
-        de_tw_xx = g_tw * df_twin * self.twin_sx * self.twin_nx
-        de_tw_yy = g_tw * df_twin * self.twin_sy * self.twin_ny
-        de_tw_xy = g_tw * 0.5 * df_twin * (self.twin_sx * self.twin_ny + self.twin_sy * self.twin_nx)
+        de_tw_xx = torch.zeros_like(phi)
+        de_tw_yy = torch.zeros_like(phi)
+        de_tw_xy = torch.zeros_like(phi)
+        for k in range(self._num_twin_variants()):
+            df_twin_k = f_eta_new_list[k] - f_eta_old_list[k]
+            sx, sy, nx, ny = self.twin_variant_pairs[k]
+            de_tw_xx = de_tw_xx + g_tw * df_twin_k * sx * nx
+            de_tw_yy = de_tw_yy + g_tw * df_twin_k * sy * ny
+            de_tw_xy = de_tw_xy + g_tw * 0.5 * df_twin_k * (sx * ny + sy * nx)
         epsp_dot_xx_twin = de_tw_xx / max(float(dt_s), 1e-12)
         epsp_dot_yy_twin = de_tw_yy / max(float(dt_s), 1e-12)
         epsp_dot_xy_twin = de_tw_xy / max(float(dt_s), 1e-12)
@@ -1958,7 +2138,8 @@ class CoupledSimulator:
 
         self.state["phi"] = phi_new
         self.state["c"] = c_new
-        self.state["eta"] = eta_new
+        self.eta_variants = [v.clone() for v in eta_variants_new]
+        self._sync_eta_variants_to_state(self.state, self.eta_variants)
         self.state["ux"] = self.last_mech["ux"]
         self.state["uy"] = self.last_mech["uy"]
 
@@ -2007,6 +2188,7 @@ class CoupledSimulator:
                             gate_mech = self.mech.solve_quasi_static(
                                 pred,
                                 self._epsp_from_state(pred),
+                                self._collect_eta_variants_from_state(pred),
                                 self.dx_um,
                                 self.dy_um,
                                 x_coords_um=self.x_coords_um,
@@ -2023,6 +2205,8 @@ class CoupledSimulator:
                                 )
                                 self.stats["mass_projection_applied"] += 1
                             self.state = pred
+                            self.eta_variants = self._collect_eta_variants_from_state(self.state)
+                            self._sync_eta_variants_to_state(self.state, self.eta_variants)
                             self.epsp = self._epsp_from_state(self.state)
                             self._sync_epsp_to_state()
                             if not bool(getattr(self.cfg.ml, "surrogate_update_plastic_fields", False)):
@@ -2035,6 +2219,7 @@ class CoupledSimulator:
                                 self.last_mech = gate_mech if gate_mech is not None else self.mech.solve_quasi_static(
                                     self.state,
                                     self.epsp,
+                                    self._collect_eta_variants_from_state(self.state),
                                     self.dx_um,
                                     self.dy_um,
                                     x_coords_um=self.x_coords_um,

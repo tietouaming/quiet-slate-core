@@ -222,27 +222,53 @@ class MechanicsModel:
             if cand:
                 self._stiffness_ref_mpa = max(max(cand), 1e-6)
 
-        sx, sy, nx, ny = resolve_twin_pair_xy(
-            cfg.twinning,
-            list(getattr(cfg, "twin_systems", [])),
-            orientation_euler_deg=list(getattr(cfg.mechanics, "crystal_orientation_euler_deg", [0.0, 0.0, 0.0])),
-            device=torch.device("cpu"),
-            dtype=torch.float64,
-        )
-        self.sx = sx
-        self.sy = sy
-        self.nx = nx
-        self.ny = ny
+        twin_systems = list(getattr(cfg, "twin_systems", []))
+        n_available = max(len(twin_systems), 1)
+        n_req = max(1, int(getattr(cfg.twinning, "n_variants", 1)))
+        idx_cfg = [int(v) for v in list(getattr(cfg.twinning, "twin_variant_indices", []))]
+        if idx_cfg:
+            idx_sel = [max(0, min(i, n_available - 1)) for i in idx_cfg[:n_req]]
+        else:
+            idx_sel = list(range(min(n_req, n_available)))
+            if not idx_sel:
+                idx_sel = [max(0, min(int(getattr(cfg.twinning, "twin_variant_index", 0)), n_available - 1))]
+        self.twin_variant_indices = idx_sel
+        pairs: List[Tuple[float, float, float, float]] = []
+        for vidx in self.twin_variant_indices:
+            sx, sy, nx, ny = resolve_twin_pair_xy(
+                cfg.twinning,
+                twin_systems,
+                orientation_euler_deg=list(getattr(cfg.mechanics, "crystal_orientation_euler_deg", [0.0, 0.0, 0.0])),
+                variant_index=vidx,
+                device=torch.device("cpu"),
+                dtype=torch.float64,
+            )
+            pairs.append((sx, sy, nx, ny))
+        self.twin_variant_pairs = pairs
+        # 兼容旧单变体逻辑：保留首个变体方向字段。
+        self.sx, self.sy, self.nx, self.ny = self.twin_variant_pairs[0]
         self._krylov_fail_streak = 0
         self._krylov_pause_left = 0
 
-    def twin_strain(self, eta: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def twin_strain(self, eta: torch.Tensor, eta_variants: List[torch.Tensor] | None = None) -> Dict[str, torch.Tensor]:
         """根据孪晶序参量 eta 计算本征应变（体积分数使用 f_twin=h(eta)）。"""
-        h = smooth_heaviside(eta)
         g = self.cfg.twinning.gamma_twin
-        exx = h * g * self.sx * self.nx
-        eyy = h * g * self.sy * self.ny
-        exy = h * 0.5 * g * (self.sx * self.ny + self.sy * self.nx)
+        if eta_variants:
+            exx = torch.zeros_like(eta)
+            eyy = torch.zeros_like(eta)
+            exy = torch.zeros_like(eta)
+            n_use = min(len(eta_variants), len(self.twin_variant_pairs))
+            for k in range(n_use):
+                h = smooth_heaviside(eta_variants[k])
+                sx, sy, nx, ny = self.twin_variant_pairs[k]
+                exx = exx + h * g * sx * nx
+                eyy = eyy + h * g * sy * ny
+                exy = exy + h * 0.5 * g * (sx * ny + sy * nx)
+        else:
+            h = smooth_heaviside(eta)
+            exx = h * g * self.sx * self.nx
+            eyy = h * g * self.sy * self.ny
+            exy = h * 0.5 * g * (self.sx * self.ny + self.sy * self.nx)
         return {"exx": exx, "eyy": eyy, "exy": exy}
 
     def _loading_mode(self) -> str:
@@ -596,6 +622,7 @@ class MechanicsModel:
         ux: torch.Tensor,
         uy: torch.Tensor,
         eta: torch.Tensor,
+        eta_variants: List[torch.Tensor] | None,
         epsp: Dict[str, torch.Tensor],
         dx_um: float,
         dy_um: float,
@@ -611,7 +638,7 @@ class MechanicsModel:
             x_coords_um=x_coords_um,
             y_coords_um=y_coords_um,
         )
-        eps_tw = self.twin_strain(eta)
+        eps_tw = self.twin_strain(eta, eta_variants=eta_variants)
         ex = eps_u["eps_xx"] + self._macro_external_strain_x() - epsp["exx"] - eps_tw["exx"]
         ey = eps_u["eps_yy"] - epsp["eyy"] - eps_tw["eyy"]
         exy = eps_u["eps_xy"] - epsp["exy"] - eps_tw["exy"]
@@ -650,6 +677,7 @@ class MechanicsModel:
         self,
         state: Dict[str, torch.Tensor],
         epsp: Dict[str, torch.Tensor],
+        eta_variants: List[torch.Tensor] | None,
         dx_um: float,
         dy_um: float,
         x_coords_um: torch.Tensor | None = None,
@@ -658,7 +686,7 @@ class MechanicsModel:
         """构造矩阵自由线性算子 A(u)=b（固定 eta/epsp/phi 的单步问题）。"""
         eta = state["eta"]
         phi = state["phi"]
-        eps_tw = self.twin_strain(eta)
+        eps_tw = self.twin_strain(eta, eta_variants=eta_variants)
 
         ex0 = self._macro_external_strain_x() - epsp["exx"] - eps_tw["exx"]
         ey0 = -epsp["eyy"] - eps_tw["eyy"]
@@ -709,6 +737,7 @@ class MechanicsModel:
         self,
         state: Dict[str, torch.Tensor],
         epsp: Dict[str, torch.Tensor],
+        eta_variants: List[torch.Tensor] | None,
         dx_um: float,
         dy_um: float,
         x_coords_um: torch.Tensor | None = None,
@@ -721,6 +750,7 @@ class MechanicsModel:
         apply_A, b_x, b_y = self._build_linear_operator_and_rhs(
             state,
             epsp,
+            eta_variants,
             dx_um,
             dy_um,
             x_coords_um=x_coords_um,
@@ -753,6 +783,7 @@ class MechanicsModel:
         self,
         state: Dict[str, torch.Tensor],
         epsp: Dict[str, torch.Tensor],
+        eta_variants: List[torch.Tensor] | None,
         dx_um: float,
         dy_um: float,
         x_coords_um: torch.Tensor | None = None,
@@ -762,6 +793,7 @@ class MechanicsModel:
         ux, uy, apply_A, b_x, b_y, diag_inv, n_iter, abs_tol, rel_tol = self._prepare_krylov_linear_system(
             state,
             epsp,
+            eta_variants,
             dx_um,
             dy_um,
             x_coords_um=x_coords_um,
@@ -845,6 +877,7 @@ class MechanicsModel:
         self,
         state: Dict[str, torch.Tensor],
         epsp: Dict[str, torch.Tensor],
+        eta_variants: List[torch.Tensor] | None,
         dx_um: float,
         dy_um: float,
         x_coords_um: torch.Tensor | None = None,
@@ -854,6 +887,7 @@ class MechanicsModel:
         ux, uy, apply_A, b_x, b_y, diag_inv, n_iter_total, abs_tol, rel_tol = self._prepare_krylov_linear_system(
             state,
             epsp,
+            eta_variants,
             dx_um,
             dy_um,
             x_coords_um=x_coords_um,
@@ -942,6 +976,7 @@ class MechanicsModel:
         self,
         state: Dict[str, torch.Tensor],
         epsp: Dict[str, torch.Tensor],
+        eta_variants: List[torch.Tensor] | None,
         dx_um: float,
         dy_um: float,
         x_coords_um: torch.Tensor | None = None,
@@ -953,6 +988,7 @@ class MechanicsModel:
             return self._solve_quasi_static_bicgstab(
                 state,
                 epsp,
+                eta_variants,
                 dx_um,
                 dy_um,
                 x_coords_um=x_coords_um,
@@ -961,6 +997,7 @@ class MechanicsModel:
         return self._solve_quasi_static_gmres(
             state,
             epsp,
+            eta_variants,
             dx_um,
             dy_um,
             x_coords_um=x_coords_um,
@@ -971,6 +1008,7 @@ class MechanicsModel:
         self,
         state: Dict[str, torch.Tensor],
         epsp: Dict[str, torch.Tensor],
+        eta_variants: List[torch.Tensor] | None,
         dx_um: float,
         dy_um: float,
         x_coords_um: torch.Tensor | None = None,
@@ -1006,6 +1044,7 @@ class MechanicsModel:
                 ux,
                 uy,
                 eta,
+                eta_variants,
                 epsp,
                 dx_um,
                 dy_um,
@@ -1052,6 +1091,7 @@ class MechanicsModel:
         self,
         state: Dict[str, torch.Tensor],
         epsp: Dict[str, torch.Tensor],
+        eta_variants: List[torch.Tensor] | None,
         dx_um: float,
         dy_um: float,
         x_coords_um: torch.Tensor | None = None,
@@ -1075,6 +1115,7 @@ class MechanicsModel:
             ux, uy, cg_ok, cg_iters, cg_res = self._solve_quasi_static_krylov(
                 state,
                 epsp,
+                eta_variants,
                 dx_um,
                 dy_um,
                 x_coords_um=x_coords_um,
@@ -1091,6 +1132,7 @@ class MechanicsModel:
                 ux, uy = self._solve_quasi_static_relax(
                     state,
                     epsp,
+                    eta_variants,
                     dx_um,
                     dy_um,
                     x_coords_um=x_coords_um,
@@ -1100,6 +1142,7 @@ class MechanicsModel:
             ux, uy = self._solve_quasi_static_relax(
                 state,
                 epsp,
+                eta_variants,
                 dx_um,
                 dy_um,
                 x_coords_um=x_coords_um,
@@ -1113,6 +1156,7 @@ class MechanicsModel:
             ux,
             uy,
             eta,
+            eta_variants,
             epsp,
             dx_um,
             dy_um,
