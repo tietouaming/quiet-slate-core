@@ -366,11 +366,14 @@ class SurrogatePredictor:
     dirichlet_right_ux: float = 0.0
     enforce_uy_anchor: bool = True
     allow_plastic_outputs: bool = True
+    output_mode: str = "delta"
     field_scales: Dict[str, float] = field(default_factory=dict)
     arch_kwargs: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.field_scales = sanitize_field_scales(FIELD_ORDER, self.field_scales)
+        m = str(getattr(self, "output_mode", "delta")).strip().lower()
+        self.output_mode = m if m in {"delta", "absolute"} else "delta"
 
     @staticmethod
     def _use_dirichlet_x(loading_mode: str) -> bool:
@@ -402,8 +405,12 @@ class SurrogatePredictor:
                 x = x.float()
             if self.channels_last:
                 x = x.contiguous(memory_format=torch.channels_last)
-            dx = self.model(x)
-            x1 = x_base + dx.to(dtype=x_base.dtype)
+            y = self.model(x).to(dtype=x_base.dtype)
+            if self.output_mode == "absolute":
+                x1 = y
+            else:
+                # 默认 delta-correction：next = current + delta
+                x1 = x_base + y
         nxt = tensor_to_state(x1, field_scales=self.field_scales)
         nxt["phi"] = _soft_project_01(torch.nan_to_num(nxt["phi"], nan=0.5, posinf=1.0, neginf=0.0))
         nxt["c"] = _soft_project_01(torch.nan_to_num(nxt["c"], nan=0.5, posinf=1.0, neginf=0.0))
@@ -563,6 +570,7 @@ def build_surrogate(
     afno_modes_y: int = 12,
     afno_depth: int = 4,
     afno_expansion: float = 2.0,
+    output_mode: str = "delta",
     field_scales: Dict[str, float] | None = None,
 ) -> SurrogatePredictor:
     """构建可直接用于推理的 SurrogatePredictor。"""
@@ -594,6 +602,7 @@ def build_surrogate(
         channels_last=channels_last and device.type == "cuda",
         model_arch=arch,
         add_coord_features=bool(add_coord_features),
+        output_mode=str(output_mode).strip().lower(),
         field_scales=sanitize_field_scales(FIELD_ORDER, field_scales),
         arch_kwargs=arch_kwargs,
     )
@@ -610,6 +619,7 @@ def save_surrogate(predictor: SurrogatePredictor, path: str | Path) -> None:
                 "model_arch": predictor.model_arch,
                 "arch_kwargs": predictor.arch_kwargs,
                 "add_coord_features": bool(predictor.add_coord_features),
+                "output_mode": str(getattr(predictor, "output_mode", "delta")),
                 "field_scales": dict(predictor.field_scales),
                 "field_order": FIELD_ORDER,
             },
@@ -650,6 +660,7 @@ def load_surrogate(
 
     arch = _normalize_arch(str(meta.get("model_arch", fallback_model_arch)))
     add_coord_features = bool(meta.get("add_coord_features", arch_kwargs.get("add_coord_features", True)))
+    output_mode = str(meta.get("output_mode", "delta")).strip().lower()
     predictor = build_surrogate(
         device=device,
         use_torch_compile=False,
@@ -668,6 +679,7 @@ def load_surrogate(
         afno_modes_y=int(arch_kwargs.get("afno_modes_y", 12)),
         afno_depth=int(arch_kwargs.get("afno_depth", 4)),
         afno_expansion=float(arch_kwargs.get("afno_expansion", 2.0)),
+        output_mode=output_mode,
         field_scales=field_scales,
     )
     state_dict = payload["state_dict"] if isinstance(payload, dict) and "state_dict" in payload else payload
@@ -682,6 +694,7 @@ def load_surrogate(
     predictor.model = _maybe_compile(predictor.model, use_torch_compile)
     predictor.model_arch = arch
     predictor.add_coord_features = bool(add_coord_features)
+    predictor.output_mode = output_mode if output_mode in {"delta", "absolute"} else "delta"
     predictor.field_scales = sanitize_field_scales(FIELD_ORDER, field_scales)
     predictor.arch_kwargs = dict(arch_kwargs)
     return predictor

@@ -241,6 +241,41 @@ def test_surrogate_gate_rejects_by_pde_residual() -> None:
     assert sim.stats["ml_reject_pde_phi"] > 0
 
 
+def test_surrogate_gate_rejects_by_local_pde_hotspot() -> None:
+    """启用局部 PDE 门控时，局部高残差热点应触发拒绝。"""
+    cfg = load_config("configs/notch_case.yaml")
+    cfg.runtime.device = "cpu"
+    cfg.domain.nx = 48
+    cfg.domain.ny = 32
+    cfg.ml.enabled = False
+    # 关闭全局 pde gate，隔离本测试到 local gate。
+    cfg.ml.enable_pde_residual_gate = False
+    cfg.ml.enable_local_pde_gate = True
+    cfg.ml.local_pde_exceed_frac_max = 1e-4
+    cfg.ml.local_pde_phi_abs_max = 1e-3
+    cfg.ml.local_pde_c_abs_max = 1e6
+    cfg.ml.local_pde_eta_abs_max = 1e6
+    cfg.ml.local_pde_mech_abs_max = 1e6
+    # 放宽其他门控，避免先被其它规则拒绝。
+    cfg.ml.max_field_delta = 10.0
+    cfg.ml.max_mean_phi_drop = 10.0
+    cfg.ml.max_mean_eta_rise = 10.0
+    cfg.ml.max_mean_phi_abs_delta = 10.0
+    cfg.ml.max_mean_eta_abs_delta = 10.0
+    cfg.ml.max_mean_c_abs_delta = 10.0
+    cfg.ml.max_mean_epspeq_abs_delta = 10.0
+    cfg.ml.residual_gate = 10.0
+    cfg.ml.enable_energy_gate = False
+    sim = CoupledSimulator(cfg)
+    prev = {k: v.clone() for k, v in sim.state.items()}
+    nxt = {k: v.clone() for k, v in prev.items()}
+    # 仅在局部制造 phi 跃迁，构造局部高残差热点。
+    nxt["phi"][:, :, 2:4, 2:4] = 0.0
+    ok = sim._surrogate_update_is_valid(prev, nxt)
+    assert ok is False
+    assert sim.stats["ml_reject_local_pde_phi"] > 0
+
+
 def test_surrogate_gate_rejects_by_energy_increase() -> None:
     """验证 surrogate 门控可由自由能上升触发拒绝。"""
     cfg = load_config("configs/notch_case.yaml")

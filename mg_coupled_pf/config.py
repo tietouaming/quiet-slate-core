@@ -305,6 +305,10 @@ class MLConfig:
     mode: str = "predictor_corrector"
     model_path: str = "artifacts/ml/surrogate_latest.pt"
     model_arch: str = "tiny_unet"
+    # surrogate 输出语义：
+    # - delta: 网络输出 Δstate，预测为 state + Δstate（推荐）
+    # - absolute: 网络输出下一时刻 state（兼容实验）
+    surrogate_output_mode: str = "delta"
     model_hidden: int = 32
     dw_hidden: int = 24
     dw_depth: int = 2
@@ -337,6 +341,13 @@ class MLConfig:
     pde_residual_eta_abs_max: float = 5e-2
     pde_residual_c_abs_max: float = 5e-2
     pde_residual_mech_abs_max: float = 5e-2
+    # 局部 PDE 门控：限制“残差高值区域面积占比”，抑制局部爆点在全局均值下被掩盖。
+    enable_local_pde_gate: bool = False
+    local_pde_exceed_frac_max: float = 2e-2
+    local_pde_phi_abs_max: float = 2e-1
+    local_pde_eta_abs_max: float = 2e-1
+    local_pde_c_abs_max: float = 2e-1
+    local_pde_mech_abs_max: float = 2e-1
     # 能量门控：限制“无外功项下的离散总能量”异常上升。
     enable_energy_gate: bool = True
     # `true` 时，energy gate 使用严格与当前演化方程匹配的 E_gate（变分核心项）；

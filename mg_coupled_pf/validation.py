@@ -480,6 +480,37 @@ def _audit_ml(cfg: SimulationConfig, rep: ConfigAuditReport) -> None:
                 path="ml.enable_energy_gate",
                 value=True,
             )
+    out_mode = str(getattr(ml, "surrogate_output_mode", "delta")).strip().lower()
+    if out_mode not in {"delta", "absolute"}:
+        rep.add_error(
+            "ML_SURROGATE_OUTPUT_MODE_INVALID",
+            "surrogate_output_mode 仅支持 delta 或 absolute。",
+            recommendation="设置 ml.surrogate_output_mode 为 delta（推荐）或 absolute。",
+            path="ml.surrogate_output_mode",
+            value=out_mode,
+        )
+    if float(getattr(ml, "local_pde_exceed_frac_max", 0.0)) < 0.0:
+        rep.add_error(
+            "ML_LOCAL_PDE_FRAC_NEGATIVE",
+            "local_pde_exceed_frac_max 不能为负数。",
+            recommendation="设置 ml.local_pde_exceed_frac_max >= 0。",
+            path="ml.local_pde_exceed_frac_max",
+            value=getattr(ml, "local_pde_exceed_frac_max", 0.0),
+        )
+    for k in (
+        "local_pde_phi_abs_max",
+        "local_pde_eta_abs_max",
+        "local_pde_c_abs_max",
+        "local_pde_mech_abs_max",
+    ):
+        if float(getattr(ml, k, 0.0)) < 0.0:
+            rep.add_error(
+                "ML_LOCAL_PDE_THRESHOLD_NEGATIVE",
+                "局部 PDE 阈值不能为负数。",
+                recommendation=f"设置 ml.{k} >= 0。",
+                path=f"ml.{k}",
+                value=getattr(ml, k, 0.0),
+            )
 
 
 def audit_config(cfg: SimulationConfig, *, config_path: str | Path | None = None) -> ConfigAuditReport:

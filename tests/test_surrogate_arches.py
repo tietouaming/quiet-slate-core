@@ -79,3 +79,23 @@ def test_predict_applies_mechanics_boundary_projection() -> None:
     assert float(torch.max(torch.abs(y["ux"][:, :, :, 0])).item()) < 1e-8
     assert float(torch.max(torch.abs(y["ux"][:, :, :, -1] - 0.123)).item()) < 1e-8
     assert abs(float(y["uy"][0, 0, 0, 0].item())) < 1e-8
+
+
+def test_surrogate_output_mode_delta_vs_absolute() -> None:
+    """surrogate 输出模式应支持 delta 与 absolute 两种语义。"""
+    dev = torch.device("cpu")
+    p = build_surrogate(
+        device=dev,
+        use_torch_compile=False,
+        channels_last=False,
+        model_arch="tiny_unet",
+        hidden=12,
+    )
+    x = _state(dev, h=16, w=20)
+    p.output_mode = "delta"
+    y_delta = p.predict(x)
+    p.output_mode = "absolute"
+    y_abs = p.predict(x)
+    # 同一模型下，两种输出语义应产生可测差异。
+    diff = float(torch.mean(torch.abs(y_delta["phi"] - y_abs["phi"])).item())
+    assert diff > 1e-5

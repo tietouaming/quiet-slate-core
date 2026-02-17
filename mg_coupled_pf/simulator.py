@@ -76,6 +76,10 @@ class StepDiagnostics:
     pde_res_c: float = 0.0
     pde_res_eta: float = 0.0
     pde_res_mech: float = 0.0
+    local_pde_phi_frac: float = 0.0
+    local_pde_c_frac: float = 0.0
+    local_pde_eta_frac: float = 0.0
+    local_pde_mech_frac: float = 0.0
     rollout_every: int = 1
 
 
@@ -193,6 +197,7 @@ class CoupledSimulator:
                 self.surrogate.enforce_displacement_constraints = bool(
                     getattr(cfg.ml, "surrogate_enforce_displacement_projection", True)
                 )
+                self.surrogate.output_mode = str(getattr(cfg.ml, "surrogate_output_mode", "delta")).strip().lower()
                 self.surrogate.loading_mode = str(cfg.mechanics.loading_mode)
                 self.surrogate.dirichlet_right_ux = float(self.mech._dirichlet_right_ux())
                 self.surrogate.enforce_uy_anchor = True
@@ -220,6 +225,10 @@ class CoupledSimulator:
             "pde_c": 0.0,
             "pde_eta": 0.0,
             "pde_mech": 0.0,
+            "local_pde_phi_frac": 0.0,
+            "local_pde_c_frac": 0.0,
+            "local_pde_eta_frac": 0.0,
+            "local_pde_mech_frac": 0.0,
             "uncertainty": 0.0,
             "mass_delta": 0.0,
         }
@@ -255,6 +264,10 @@ class CoupledSimulator:
             "ml_reject_pde_c": 0,
             "ml_reject_pde_eta": 0,
             "ml_reject_pde_mech": 0,
+            "ml_reject_local_pde_phi": 0,
+            "ml_reject_local_pde_c": 0,
+            "ml_reject_local_pde_eta": 0,
+            "ml_reject_local_pde_mech": 0,
             "ml_reject_energy": 0,
             "ml_energy_gate_skipped_nonvariational": 0,
             "ml_reject_uncertainty": 0,
@@ -443,6 +456,23 @@ class CoupledSimulator:
         den = torch.clamp(self._mean_field(m), min=1e-12)
         return float((num / den).item())
 
+    def _masked_exceed_fraction(
+        self,
+        x: torch.Tensor,
+        threshold: float,
+        mask: torch.Tensor | None = None,
+    ) -> float:
+        """计算 |x| 超过阈值的面积占比（带可选权重掩膜）。"""
+        th = max(float(threshold), 0.0)
+        ax = torch.abs(torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0))
+        exc = (ax > th).to(dtype=ax.dtype)
+        if mask is None:
+            return float(self._mean_field(exc).item())
+        m = torch.clamp(torch.nan_to_num(mask, nan=0.0, posinf=1.0, neginf=0.0), min=0.0, max=1.0)
+        num = self._mean_field(exc * m)
+        den = torch.clamp(self._mean_field(m), min=1e-12)
+        return float((num / den).item())
+
     def _epsp_from_state(self, state: Dict[str, torch.Tensor] | None = None) -> Dict[str, torch.Tensor]:
         """从 state 字典读取塑性张量；缺失时回退到内部缓存。"""
         st = self.state if state is None else state
@@ -603,7 +633,7 @@ class CoupledSimulator:
         nxt: Dict[str, torch.Tensor],
         mech_state: Dict[str, torch.Tensor],
         dt_s: float,
-    ) -> Dict[str, float]:
+    ) -> Dict[str, float | torch.Tensor]:
         """计算 surrogate 候选状态的离散 PDE 残差。"""
         bc = self._scalar_bc()
         dt = max(float(dt_s), 1e-12)
@@ -707,6 +737,22 @@ class CoupledSimulator:
         l_ref = max(min(float(self.dx_um), float(self.dy_um)), 1e-9)
         sigma_ref = max(float(self.cfg.mechanics.mu_GPa * 1e3), 1.0)
         mech_scale = max(sigma_ref / l_ref, 1e-12)
+        pde_phi_field = torch.abs(torch.nan_to_num(r_phi, nan=0.0, posinf=0.0, neginf=0.0)) / phi_scale
+        pde_c_field = torch.abs(torch.nan_to_num(r_c, nan=0.0, posinf=0.0, neginf=0.0)) / c_scale
+        pde_eta_field = torch.abs(torch.nan_to_num(r_eta, nan=0.0, posinf=0.0, neginf=0.0)) / eta_scale
+        res_mx, res_my = self.mech.stress_divergence(
+            mech_state["sigma_xx"],
+            mech_state["sigma_yy"],
+            mech_state["sigma_xy"],
+            self.dx_um,
+            self.dy_um,
+            x_coords_um=self.x_coords_um,
+            y_coords_um=self.y_coords_um,
+        )
+        pde_mech_field = 0.5 * (
+            torch.abs(torch.nan_to_num(res_mx, nan=0.0, posinf=0.0, neginf=0.0))
+            + torch.abs(torch.nan_to_num(res_my, nan=0.0, posinf=0.0, neginf=0.0))
+        ) / mech_scale
         pde_phi = float(pde_phi / phi_scale)
         pde_c = float(pde_c_raw / c_scale)
         pde_eta = float(pde_eta_raw / eta_scale)
@@ -716,6 +762,10 @@ class CoupledSimulator:
             "pde_c": pde_c,
             "pde_eta": pde_eta,
             "pde_mech": pde_mech,
+            "pde_phi_field": pde_phi_field,
+            "pde_c_field": pde_c_field,
+            "pde_eta_field": pde_eta_field,
+            "pde_mech_field": pde_mech_field,
         }
 
     def _estimate_surrogate_uncertainty(self, prev: Dict[str, torch.Tensor]) -> float:
@@ -1556,6 +1606,10 @@ class CoupledSimulator:
         self._last_gate_metrics["pde_c"] = 0.0
         self._last_gate_metrics["pde_eta"] = 0.0
         self._last_gate_metrics["pde_mech"] = 0.0
+        self._last_gate_metrics["local_pde_phi_frac"] = 0.0
+        self._last_gate_metrics["local_pde_c_frac"] = 0.0
+        self._last_gate_metrics["local_pde_eta_frac"] = 0.0
+        self._last_gate_metrics["local_pde_mech_frac"] = 0.0
         self._last_gate_metrics["uncertainty"] = 0.0
         self._last_gate_metrics["mass_delta"] = 0.0
 
@@ -1648,32 +1702,80 @@ class CoupledSimulator:
         mech_prev = self._estimate_state_mechanics(prev)
         mech_nxt = candidate_mech if candidate_mech is not None else self._estimate_state_mechanics(nxt)
 
-        if bool(self.cfg.ml.enable_pde_residual_gate):
+        use_global_pde_gate = bool(self.cfg.ml.enable_pde_residual_gate)
+        use_local_pde_gate = bool(getattr(self.cfg.ml, "enable_local_pde_gate", False))
+        if use_global_pde_gate or use_local_pde_gate:
             residuals = self._compute_pde_residuals(prev, nxt, mech_nxt, self.cfg.numerics.dt_s)
             self._last_gate_metrics["pde_phi"] = residuals["pde_phi"]
             self._last_gate_metrics["pde_c"] = residuals["pde_c"]
             self._last_gate_metrics["pde_eta"] = residuals["pde_eta"]
             self._last_gate_metrics["pde_mech"] = residuals["pde_mech"]
-            if (
-                self.cfg.ml.pde_residual_phi_abs_max > 0.0
-                and residuals["pde_phi"] > float(self.cfg.ml.pde_residual_phi_abs_max)
-            ):
-                return reject("pde_phi")
-            if (
-                self.cfg.ml.pde_residual_c_abs_max > 0.0
-                and residuals["pde_c"] > float(self.cfg.ml.pde_residual_c_abs_max)
-            ):
-                return reject("pde_c")
-            if (
-                self.cfg.ml.pde_residual_eta_abs_max > 0.0
-                and residuals["pde_eta"] > float(self.cfg.ml.pde_residual_eta_abs_max)
-            ):
-                return reject("pde_eta")
-            if (
-                self.cfg.ml.pde_residual_mech_abs_max > 0.0
-                and residuals["pde_mech"] > float(self.cfg.ml.pde_residual_mech_abs_max)
-            ):
-                return reject("pde_mech")
+            if use_global_pde_gate:
+                if (
+                    self.cfg.ml.pde_residual_phi_abs_max > 0.0
+                    and residuals["pde_phi"] > float(self.cfg.ml.pde_residual_phi_abs_max)
+                ):
+                    return reject("pde_phi")
+                if (
+                    self.cfg.ml.pde_residual_c_abs_max > 0.0
+                    and residuals["pde_c"] > float(self.cfg.ml.pde_residual_c_abs_max)
+                ):
+                    return reject("pde_c")
+                if (
+                    self.cfg.ml.pde_residual_eta_abs_max > 0.0
+                    and residuals["pde_eta"] > float(self.cfg.ml.pde_residual_eta_abs_max)
+                ):
+                    return reject("pde_eta")
+                if (
+                    self.cfg.ml.pde_residual_mech_abs_max > 0.0
+                    and residuals["pde_mech"] > float(self.cfg.ml.pde_residual_mech_abs_max)
+                ):
+                    return reject("pde_mech")
+
+            if use_local_pde_gate:
+                frac_max = max(float(getattr(self.cfg.ml, "local_pde_exceed_frac_max", 0.0)), 0.0)
+                solid = self._solid_weight(nxt["phi"])
+                phi_th = max(
+                    float(getattr(self.cfg.ml, "local_pde_phi_abs_max", 0.0)),
+                    0.0,
+                )
+                c_th = max(
+                    float(getattr(self.cfg.ml, "local_pde_c_abs_max", 0.0)),
+                    0.0,
+                )
+                eta_th = max(
+                    float(getattr(self.cfg.ml, "local_pde_eta_abs_max", 0.0)),
+                    0.0,
+                )
+                mech_th = max(
+                    float(getattr(self.cfg.ml, "local_pde_mech_abs_max", 0.0)),
+                    0.0,
+                )
+                # 若 local 阈值未给出，则回退到全局阈值。
+                if phi_th <= 0.0:
+                    phi_th = max(float(self.cfg.ml.pde_residual_phi_abs_max), 0.0)
+                if c_th <= 0.0:
+                    c_th = max(float(self.cfg.ml.pde_residual_c_abs_max), 0.0)
+                if eta_th <= 0.0:
+                    eta_th = max(float(self.cfg.ml.pde_residual_eta_abs_max), 0.0)
+                if mech_th <= 0.0:
+                    mech_th = max(float(self.cfg.ml.pde_residual_mech_abs_max), 0.0)
+                phi_frac = self._masked_exceed_fraction(residuals["pde_phi_field"], phi_th, None)
+                c_frac = self._masked_exceed_fraction(residuals["pde_c_field"], c_th, None)
+                eta_frac = self._masked_exceed_fraction(residuals["pde_eta_field"], eta_th, solid)
+                mech_frac = self._masked_exceed_fraction(residuals["pde_mech_field"], mech_th, solid)
+                self._last_gate_metrics["local_pde_phi_frac"] = float(phi_frac)
+                self._last_gate_metrics["local_pde_c_frac"] = float(c_frac)
+                self._last_gate_metrics["local_pde_eta_frac"] = float(eta_frac)
+                self._last_gate_metrics["local_pde_mech_frac"] = float(mech_frac)
+                if frac_max > 0.0 and phi_frac > frac_max:
+                    return reject("local_pde_phi")
+                if frac_max > 0.0 and c_frac > frac_max:
+                    return reject("local_pde_c")
+                if frac_max > 0.0 and eta_frac > frac_max:
+                    return reject("local_pde_eta")
+                if frac_max > 0.0 and mech_frac > frac_max:
+                    return reject("local_pde_mech")
 
         energy_gate_enabled = bool(self.cfg.ml.enable_energy_gate)
         use_variational_gate_energy = bool(getattr(self.cfg.ml, "energy_gate_use_variational_core", True))
@@ -2155,6 +2257,10 @@ class CoupledSimulator:
         self._last_gate_metrics["pde_c"] = 0.0
         self._last_gate_metrics["pde_eta"] = 0.0
         self._last_gate_metrics["pde_mech"] = 0.0
+        self._last_gate_metrics["local_pde_phi_frac"] = 0.0
+        self._last_gate_metrics["local_pde_c_frac"] = 0.0
+        self._last_gate_metrics["local_pde_eta_frac"] = 0.0
+        self._last_gate_metrics["local_pde_mech_frac"] = 0.0
         self._last_gate_metrics["uncertainty"] = 0.0
         self._last_gate_metrics["mass_delta"] = 0.0
 
@@ -2287,6 +2393,10 @@ class CoupledSimulator:
             pde_res_c=float(self._last_gate_metrics.get("pde_c", 0.0)),
             pde_res_eta=float(self._last_gate_metrics.get("pde_eta", 0.0)),
             pde_res_mech=float(self._last_gate_metrics.get("pde_mech", 0.0)),
+            local_pde_phi_frac=float(self._last_gate_metrics.get("local_pde_phi_frac", 0.0)),
+            local_pde_c_frac=float(self._last_gate_metrics.get("local_pde_c_frac", 0.0)),
+            local_pde_eta_frac=float(self._last_gate_metrics.get("local_pde_eta_frac", 0.0)),
+            local_pde_mech_frac=float(self._last_gate_metrics.get("local_pde_mech_frac", 0.0)),
             rollout_every=int(self._current_rollout_every),
         )
 
@@ -2341,6 +2451,10 @@ class CoupledSimulator:
                     "pde_res_c": diag.pde_res_c,
                     "pde_res_eta": diag.pde_res_eta,
                     "pde_res_mech": diag.pde_res_mech,
+                    "local_pde_phi_frac": diag.local_pde_phi_frac,
+                    "local_pde_c_frac": diag.local_pde_c_frac,
+                    "local_pde_eta_frac": diag.local_pde_eta_frac,
+                    "local_pde_mech_frac": diag.local_pde_mech_frac,
                     "rollout_every": float(diag.rollout_every),
                 }
             )
@@ -2352,6 +2466,12 @@ class CoupledSimulator:
                 total_t = self.cfg.numerics.n_steps * self.cfg.numerics.dt_s
                 wall_elapsed_s = time.perf_counter() - t0_wall
                 wall_eta_s = wall_elapsed_s * (1.0 - frac) / max(frac, 1e-12)
+                local_hot = max(
+                    diag.local_pde_phi_frac,
+                    diag.local_pde_c_frac,
+                    diag.local_pde_eta_frac,
+                    diag.local_pde_mech_frac,
+                )
                 print(
                     f"[{progress_prefix}] [{bar}] {frac*100:6.2f}% "
                     f"t={diag.time_s:.6f}/{total_t:.6f} s dt={self.cfg.numerics.dt_s:.2e} s "
@@ -2363,6 +2483,7 @@ class CoupledSimulator:
                     f"F={diag.free_energy:.3e} "
                     f"Rphi={diag.pde_res_phi:.2e} Rc={diag.pde_res_c:.2e} "
                     f"Reta={diag.pde_res_eta:.2e} Rmech={diag.pde_res_mech:.2e} "
+                    f"Lhot={local_hot:.2e} "
                     f"roll={diag.rollout_every} surrogate={int(diag.used_surrogate_only)}"
                 )
 
