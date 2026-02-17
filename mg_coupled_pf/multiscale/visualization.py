@@ -133,3 +133,45 @@ def plot_uncertainty_calibration(
     plt.close(fig)
     return p
 
+
+def plot_active_learning_progress(
+    round_reports: Sequence[Dict[str, object]],
+    out_path: Path | str,
+) -> Path:
+    """绘制主动学习轮次进展（样本数、验证损失、PCI）。"""
+    p = Path(out_path)
+    _ensure_parent(p)
+    rr = list(round_reports)
+    if not rr:
+        raise ValueError("round_reports is empty")
+
+    rounds: List[int] = []
+    n_samples: List[float] = []
+    val_loss: List[float] = []
+    pci: List[float] = []
+    for r in rr:
+        rid = int(r.get("round", len(rounds)))
+        tr = r.get("train_report", {})
+        rounds.append(rid)
+        n_samples.append(float(r.get("n_samples", np.nan)))
+        val_loss.append(float(tr.get("best_val_loss", np.nan)) if isinstance(tr, dict) else np.nan)
+        bpm = tr.get("best_physics_metrics", {}) if isinstance(tr, dict) else {}
+        pci.append(float(bpm.get("physics_consistency_index", np.nan)) if isinstance(bpm, dict) else np.nan)
+
+    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2), dpi=140)
+    axes[0].plot(rounds, n_samples, "o-", label="n_samples")
+    axes[0].set_xlabel("active learning round")
+    axes[0].set_ylabel("samples")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+
+    axes[1].plot(rounds, val_loss, "o-", label="best_val_loss")
+    axes[1].plot(rounds, pci, "s-", label="PCI")
+    axes[1].set_xlabel("active learning round")
+    axes[1].set_ylabel("metric")
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend()
+    fig.tight_layout()
+    fig.savefig(p)
+    plt.close(fig)
+    return p

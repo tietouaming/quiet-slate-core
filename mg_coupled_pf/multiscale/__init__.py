@@ -24,6 +24,8 @@ from .advanced_models import (
     save_advanced_model,
 )
 from .advanced_train import AdvancedTrainingConfig, train_advanced_multiscale_model
+from .active_learning import ActiveLearningConfig, run_active_learning_loop
+from .closed_loop_design import ClosedLoopDesignConfig, run_closed_loop_design
 from .features import extract_micro_descriptors, extract_micro_tensor
 from .inverse_design import (
     DesignVariableSpec,
@@ -34,7 +36,12 @@ from .inverse_design import (
 from .models import MacroCorrosionPredictor, MultiScaleModelConfig, load_multiscale_model, save_multiscale_model
 from .physics_metrics import PhysicsMetricConfig, evaluate_physics_metrics
 from .train import TrainingConfig, train_multiscale_model
-from .visualization import plot_parity_by_target, plot_training_history, plot_uncertainty_calibration
+from .visualization import (
+    plot_active_learning_progress,
+    plot_parity_by_target,
+    plot_training_history,
+    plot_uncertainty_calibration,
+)
 
 __all__ = [
     "MacroTargetSpec",
@@ -52,11 +59,16 @@ __all__ = [
     "load_advanced_model",
     "AdvancedTrainingConfig",
     "train_advanced_multiscale_model",
+    "ActiveLearningConfig",
+    "run_active_learning_loop",
+    "ClosedLoopDesignConfig",
+    "run_closed_loop_design",
     "PhysicsMetricConfig",
     "evaluate_physics_metrics",
     "plot_training_history",
     "plot_parity_by_target",
     "plot_uncertainty_calibration",
+    "plot_active_learning_progress",
     "extract_micro_descriptors",
     "extract_micro_tensor",
     "DesignVariableSpec",
