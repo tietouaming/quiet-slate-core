@@ -107,6 +107,20 @@ def main() -> None:
     if args.disable_torch_compile:
         common_run_args += ["--disable-torch-compile"]
 
+    # 0) 配置审计（先于测试与仿真，提前发现配置层问题）。
+    audit = run_cmd(
+        [
+            "scripts/audit_config.py",
+            "--config",
+            args.config,
+            "--output",
+            "artifacts/validation/config_audit_run_all_checks.json",
+            "--strict",
+        ],
+        timeout_s=120,
+    )
+    report["config_audit"] = parse_last_json(audit["stdout"])
+
     # 1) 单测。
     pytest_res = run_cmd(["-m", "pytest", "-q"], timeout_s=600)
     report["pytest"] = {"wall_time_s": pytest_res["wall_time_s"], "stdout": pytest_res["stdout"]}

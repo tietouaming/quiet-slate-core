@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from mg_coupled_pf import CoupledSimulator, load_config
+from mg_coupled_pf import CoupledSimulator, audit_config, load_config, save_audit_report, summarize_audit_report
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,6 +53,29 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--progress", action="store_true")
     p.add_argument("--progress-every", type=int, default=50)
     p.add_argument("--disable-ml", action="store_true")
+    p.add_argument(
+        "--audit-config",
+        dest="audit_config",
+        action="store_true",
+        default=True,
+        help="Run configuration/physics audit before simulation (default: enabled).",
+    )
+    p.add_argument(
+        "--no-audit-config",
+        dest="audit_config",
+        action="store_false",
+        help="Disable pre-run configuration audit.",
+    )
+    p.add_argument(
+        "--strict-audit",
+        action="store_true",
+        help="Abort run when audit contains errors.",
+    )
+    p.add_argument(
+        "--audit-output",
+        default="",
+        help="Optional audit report path. Empty means output_dir/case_name/config_audit.json.",
+    )
     p.add_argument(
         "--render-intermediate-fields",
         dest="render_intermediate_fields",
@@ -139,6 +162,29 @@ def main() -> None:
     if args.render_grid_figure is not None:
         cfg.runtime.render_grid_figure = bool(args.render_grid_figure)
 
+    audit_payload = None
+    if bool(args.audit_config):
+        rep = audit_config(cfg, config_path=args.config)
+        if args.audit_output:
+            audit_path = save_audit_report(rep, args.audit_output)
+        else:
+            audit_path = save_audit_report(
+                rep,
+                Path(cfg.runtime.output_dir) / cfg.runtime.case_name / "config_audit.json",
+            )
+        summary = summarize_audit_report(rep)
+        print(f"[config-audit] {summary} -> {audit_path}")
+        audit_payload = {
+            "passed": rep.passed,
+            "summary": summary,
+            "errors": rep.error_count,
+            "warnings": rep.warning_count,
+            "infos": rep.info_count,
+            "report_path": str(audit_path),
+        }
+        if bool(args.strict_audit) and (not rep.passed):
+            raise SystemExit("Configuration audit failed in strict mode.")
+
     # 3) 构建求解器并运行。
     sim = CoupledSimulator(cfg)
     outputs = sim.run(
@@ -176,6 +222,7 @@ def main() -> None:
                 "final_clouds_dir_exists": Path(outputs["final_clouds_dir"]).exists(),
                 "wall_time_s": float(outputs.get("wall_time_s", 0.0)),
                 "device": str(sim.device),
+                "config_audit": audit_payload,
             },
             ensure_ascii=False,
             indent=2,

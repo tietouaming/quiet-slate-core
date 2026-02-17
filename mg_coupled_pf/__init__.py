@@ -8,5 +8,14 @@
 
 from .config import SimulationConfig, load_config
 from .simulator import CoupledSimulator
+from .validation import ConfigAuditReport, audit_config, save_audit_report, summarize_audit_report
 
-__all__ = ["SimulationConfig", "load_config", "CoupledSimulator"]
+__all__ = [
+    "SimulationConfig",
+    "load_config",
+    "CoupledSimulator",
+    "ConfigAuditReport",
+    "audit_config",
+    "save_audit_report",
+    "summarize_audit_report",
+]
