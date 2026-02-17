@@ -66,6 +66,7 @@ def main() -> None:
     result: Dict[str, int] = {
         "count_mode": "tracked+untracked" if bool(args.include_untracked) else "tracked",
         "total_files": len(files),
+        "total_tracked_files": len(files) if (not bool(args.include_untracked)) else len(git_ls_files()),
         "py_files": len(py),
         "py_lines_total": sum_lines(py),
         "py_lines_core": sum_lines(core_py),
